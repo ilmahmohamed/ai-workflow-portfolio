@@ -1,0 +1,30 @@
+## Baseline test
+
+I entered 10 sample leads from our outreach tool into Attio by hand, as People records. Each lead needed a name, job title, email, company, Lead source, Lead status and a note.
+
+How I chose the Lead status:
+- Email sent, no reply yet = Contacted
+- Replied = Qualified (or Contacted if the reply was not interested)
+- Lead source was set to a new option, Outbound, because none of the existing options fitted
+
+I also created one Deal for each lead:
+- No reply = New
+- Replied = Qualified
+
+Time taken: [X] minutes for 10 leads, about [Y] minutes per lead (People only: [A] minutes, Deals: [B] minutes)
+
+Mistakes and problems:
+1. [What went wrong and how I noticed it]
+2. [What went wrong and how I noticed it]
+3. One contact had no surname and a general inbox email (marketing@), so the name was incomplete
+
+What was slow or annoying:
+- Typing each email by hand risks typos
+- Person and deal had to be updated separately, because Lead status and Deal stage don't sync
+- Picking the company and person again on every deal form
+
+Fields I was unsure about:
+- Lead source (no option for outbound leads)
+- Lead status for leads that replied
+
+What this tells me: doing this by hand takes about [X] minutes for 10 leads, so 100 leads would take about [X x 10] minutes. This is the part I could automate in later days.
