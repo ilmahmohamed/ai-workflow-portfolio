@@ -41,7 +41,7 @@ New, Qualified, Meeting booked, Proposal, Won, Lost.
 
 My first import left Lead source and Lead status empty, because Attio had not created the dropdown options. I imported the same file again, matched on email address, and turned on "Create missing select options". Attio updated the 30 people and created no duplicates.
 
-## Baseline test — Manual lead entry
+## Baseline test - Manual lead entry
 
 ### What I did
 
