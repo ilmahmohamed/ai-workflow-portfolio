@@ -41,6 +41,11 @@ New, Qualified, Meeting booked, Proposal, Won, Lost.
 
 My first import left Lead source and Lead status empty, because Attio had not created the dropdown options. I imported the same file again, matched on email address, and turned on "Create missing select options". Attio updated the 30 people and created no duplicates.
 
+<img width="648" height="429" alt="Deals tab with example for each catergory " src="https://github.com/user-attachments/assets/dc4f864c-296a-4861-b4fc-bbf38a294f52" />
+<img width="653" height="437" alt="30 Fake Companies" src="https://github.com/user-attachments/assets/4ca82332-91d4-4e6c-9b7d-1bdb9f0bbb2b" />
+<img width="673" height="425" alt="30 Fake People" src="https://github.com/user-attachments/assets/d80fa98d-4342-401e-bee8-68e3f134ad3b" />
+
+
 ## Baseline test - Manual lead entry
 
 ### What I did
@@ -92,3 +97,7 @@ The existing Won and Lost practice deals were not part of these 10 baseline lead
 I now understand how People, Companies and Deals connect, and how to use a relationship attribute to link records. I also learned that Lead status and deal Stage need to be managed separately in my setup.
 
 For a future comparison with automation, I will use the same fields and status rules, and record setup time separately from data entry time.
+
+<img width="641" height="426" alt="Baseline test - Deals " src="https://github.com/user-attachments/assets/b0fbf73c-cf97-4cd9-904a-a123b1fc0814" />
+<img width="480" height="229" alt="Baseline test - People" src="https://github.com/user-attachments/assets/676acf5b-f23c-4e21-a310-a0855ba9a44a" />
+<img width="761" height="247" alt="Baseline test - Companies" src="https://github.com/user-attachments/assets/21e02c4f-b338-4b07-8003-f5d8e8a639fa" />
