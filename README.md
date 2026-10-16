@@ -4,7 +4,7 @@ Practice AI automation projects for a fictional company, Nova Wellness. All data
 
 ## Who I am
 
-Hi, I'm Ilmah Mohamed. I'm learning to build AI and automation workflows for small companies, with a focus on the work an executive assistant does every day: inbox triage, replies, meeting notes and daily briefings. This is a 3-week training project.
+Hi, I'm Ilmah Mohamed. I'm learning to build AI and automation workflows for startups, with a focus on the work an executive assistant does every day: inbox triage, replies, meeting notes and daily briefings. This is a 3-week training project.
 
 ## What I've built so far (Week 1)
 
