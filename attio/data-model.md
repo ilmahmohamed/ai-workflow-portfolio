@@ -56,7 +56,7 @@ This baseline only covers those 10 leads. It excludes the fictional Nova Wellnes
 
 ### Time taken
 
-Approximately **2 hours and 35 minutes (155 minutes)**.
+Approximately **2 hours and 35 minutes**.
 
 This includes entering information, learning how to connect the records, checking statuses and making corrections.
 
