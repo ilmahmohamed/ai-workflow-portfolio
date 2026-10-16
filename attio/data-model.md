@@ -41,6 +41,54 @@ New, Qualified, Meeting booked, Proposal, Won, Lost.
 
 My first import left Lead source and Lead status empty, because Attio had not created the dropdown options. I imported the same file again, matched on email address, and turned on "Create missing select options". Attio updated the 30 people and created no duplicates.
 
-## Baseline test
+## Baseline test — Manual lead entry
 
-(To fill in after the test: number of lead emails, time taken, mistakes.)
+### What I did
+
+I used 10 leads from Reachify. I manually entered their details under People, linked them to Companies and created corresponding Deals in Attio.
+
+This baseline only covers those 10 leads. It excludes the fictional Nova Wellness records and other practice deals.
+
+### Time taken
+
+Approximately **2 hours and 35 minutes (155 minutes)**.
+
+This includes entering information, learning how to connect the records, checking statuses and making corrections.
+
+### How I interpreted the statuses
+
+| Status | How I used it or what it means |
+|---|---|
+| New | I used this deal stage where there was no reply or confirmed progress. |
+| Contacted | I used this lead status where Reachify showed that outreach had been sent. A Contacted lead could still have a deal in New. |
+| Qualified | I initially treated a reply as Qualified. This needs reviewing because a reply alone does not confirm interest or suitability. |
+| Meeting booked | A meeting has been confirmed. |
+| Proposal | A proposal has been sent for the opportunity. |
+| Won | The customer has confirmed acceptance or agreed to proceed. |
+| Lost | The opportunity has been declined or confirmed as not proceeding. No reply alone does not mean Lost. |
+
+The existing Won and Lost practice deals were not part of these 10 baseline leads.
+
+### Mistakes, difficulties and corrections
+
+- **I expected Lead status to update the Deals pipeline.** I later realised that Lead status and deal Stage were separate attributes and updated them separately.
+- **I struggled to link People directly to Deals.** I later figured out how to add a relationship attribute and link the person to the deal. I also linked People to their Companies.
+- **I confused contact activity with deal progress.** I learned that sending an email means the lead has been contacted, but does not automatically make the opportunity qualified.
+- **I was unsure which deal stages to use.** I initially used replies as a shortcut for Qualified. I still need to review the responses to confirm whether that classification is appropriate.
+- **Switching between Reachify, People, Companies and Deals took time.** I had to work out where each detail belonged and check that I was updating the correct record.
+
+### Checks completed
+
+- Checked that all 10 deals are linked to the correct company and person.
+- Checked and completed the missing Lead source and Lead status values for the 10 records.
+
+### Still to review
+
+- Review the replies for leads marked Qualified to confirm interest and suitability.
+- Verify company details against the source where automatically populated information appears inconsistent.
+
+### What I learned
+
+I now understand how People, Companies and Deals connect, and how to use a relationship attribute to link records. I also learned that Lead status and deal Stage need to be managed separately in my setup.
+
+For a future comparison with automation, I will use the same fields and status rules, and record setup time separately from data entry time.
