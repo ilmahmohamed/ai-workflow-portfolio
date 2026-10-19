@@ -67,6 +67,10 @@ See the screenshots in [attio/data-model.md](attio/data-model.md).
 
 Outlook, Slack, Attio, Zapier, Make (starting Week 2), Google AI Studio (Gemini), ChatGPT, Claude, Grok, GitHub
 
+## Safety
+
+No passwords or API keys are stored in this repo. They live in a private `.env` file that git ignores, and in GitHub Secrets. The tests use fake data only.
+
 ## How to read this repo
 
 Start with `weekly-updates/week-1-log.md` for the story, then `prompts/` for examples of the work.
