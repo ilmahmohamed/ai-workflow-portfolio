@@ -1,4 +1,4 @@
-# Build or configure? Nova Wellness email-to-Attio pipeline
+# Build or configure - Nova Wellness email-to-Attio pipeline
 
 Written on Day 6 as practice. Before building anything, I checked what Attio can already do on its own.
 
