@@ -1,33 +1,30 @@
-# Build or configure - Nova Wellness email-to-Attio pipeline
-
-Written on Day 6 as practice. Before building anything, I checked what Attio can already do on its own.
-
-## What Attio does by itself
-
-- Email sync can create people and companies from emails, but only for Microsoft 365 mailboxes. It does not work with a free outlook.com mailbox like the Nova Wellness one.
-- It also creates records for newsletters, auto-replies and people who are only cc'd.
-- It cannot judge whether an email is really a lead. It only has blocklists.
-- Workflows can create a deal and post to Slack, but any AI step uses credits.
-- It cannot save a draft reply in Outlook.
-
-## What is left to build
-
-| Step | Attio alone | Needs a script |
-|---|---|---|
-| Read the Leads folder | Not with a free mailbox | Yes |
-| Skip auto-replies and newsletters | Blocklists only | Yes |
-| Pull out name, company, request, urgency | AI step, costs credits | Yes |
-| Create or update person, company, deal | Yes, with a workflow | Could stay in Attio |
-| Post to Slack #leads | Yes | Could stay in Attio |
-| Save a draft reply in Outlook | No | Yes |
-
-## Cost (estimates from the Week 2 plan, to be checked on Day 9)
-
-- Attio credits: Free 250 a month, Plus 1,500, Pro 10,000.
-- Example: 200 emails, 80 of them leads is about 680 credits a month, which fits Plus (about $105 a month).
-- With research on each lead it is about 2,280 credits, which needs a higher plan (about $175 to $237 a month).
-- The script: about $2 to $5 a month for AI use, plus about an hour a month of upkeep.
+# Build or configure: lead intake for Nova Wellness
 
 ## Recommendation
+Use Attio for what it already does well, and build only the small pieces it cannot do. This keeps the monthly cost low and the setup easy to maintain.
 
-Build the script for the filter, the data extraction and the Outlook draft, because Attio cannot do these well. Let Attio keep storing the records and checking for duplicates. If a client is already on Attio Plus with a Microsoft 365 mailbox, an Attio workflow may be the better choice.
+## What Attio already does for us
+- Keeps a record of every person, company and deal in one place.
+- Spots duplicates, so the same lead is not entered twice.
+- Can run automatic steps once a record exists, including simple AI steps. These use up "credits" each month.
+
+## What is still left to build
+- Deciding which emails are real enquiries and which are noise.
+- Reading a messy email and pulling out the key details (name, company, what they want).
+- Writing a draft reply in Outlook. It is never sent without a person approving it.
+- Posting each new lead to the team's Slack channel.
+- Alerting the team when something fails, so nothing is lost quietly.
+
+## Monthly cost of each option
+Example volume: 200 emails a month, about 80 of them real leads.
+
+| Option | Approx. monthly cost | Effort to keep running |
+|---|---|---|
+| Attio does everything on its own (Plus plan) | about $105 | Low |
+| Same, with extra AI research on each lead | about $175 to $237 | Low |
+| Our own small script for the steps above, with Attio only storing records | about $2 to $5 for AI usage, plus whichever Attio plan the client already has | About one hour a month |
+
+For reference, Attio's monthly credits are 250 (Free), 1,500 (Plus) and 10,000 (Pro). Our example uses about 680 credits without research and about 2,280 with it.
+
+## When to choose differently
+If a client is already on Attio Plus and uses Microsoft 365, Attio's own automations may be enough and the script is not needed. For a client who wants lower running costs or more control, the script is the better choice.
