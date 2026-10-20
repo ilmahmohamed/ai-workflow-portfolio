@@ -1,0 +1,290 @@
+[
+  {
+    "id": 1,
+    "is_lead": true,
+    "name": "Priya Raman",
+    "email": "priya.raman@example.com",
+    "company": "Sunrise Physio",
+    "role": "Operations Manager",
+    "request_type": "demo",
+    "urgency": 1,
+    "summary": "Physio clinic group wants a demo of booking reminders and rebooking within two weeks."
+  },
+  {
+    "id": 2,
+    "is_lead": true,
+    "name": "Marcus Hale",
+    "email": "marcus.hale@example.com",
+    "company": "Hale Nutrition",
+    "role": "Nutritionist",
+    "request_type": "partnership",
+    "urgency": 1,
+    "summary": "Nutritionist offers to recommend Nova Wellness to clients in a referral arrangement."
+  },
+  {
+    "id": 3,
+    "is_lead": true,
+    "name": "Lena Fischer",
+    "email": "lena.fischer@freemail.example.com",
+    "company": null,
+    "role": "Freelance yoga teacher",
+    "request_type": "pricing",
+    "urgency": 1,
+    "summary": "Solo yoga teacher asks for the price and whether there is a cheap or free plan."
+  },
+  {
+    "id": 4,
+    "is_lead": true,
+    "name": "Darius Kowalski",
+    "email": "darius.kowalski@example.com",
+    "company": "Ironworks Gym",
+    "role": "Owner",
+    "request_type": "demo",
+    "urgency": 3,
+    "summary": "Gym owner urgently needs a demo before the current system stops working on Friday."
+  },
+  {
+    "id": 5,
+    "is_lead": false
+  },
+  {
+    "id": 6,
+    "is_lead": true,
+    "name": "Elena Vasquez",
+    "email": "elena.vasquez@example.com",
+    "company": "Oakridge Wellness Collective",
+    "role": "Finance Lead",
+    "request_type": "pricing",
+    "urgency": 2,
+    "summary": "Four-location group asks detailed pricing and contract questions before a budget meeting at the end of the month."
+  },
+  {
+    "id": 7,
+    "is_lead": true,
+    "name": "Tom Becker",
+    "email": "tom.becker@example.com",
+    "company": "Sunrise Physio",
+    "role": "Finance",
+    "request_type": "demo",
+    "urgency": 1,
+    "summary": "Finance contact at Sunrise Physio wants to join the demo, mainly to see invoicing and reports."
+  },
+  {
+    "id": 8,
+    "is_lead": true,
+    "name": "Sanne de Vries",
+    "email": "sanne.devries@example.com",
+    "company": "Zonnebloem Fysio",
+    "role": null,
+    "request_type": "partnership",
+    "urgency": 1,
+    "summary": "Physio practice proposes a mutual referral partnership for post-treatment wellness programmes."
+  },
+  {
+    "id": 9,
+    "is_lead": true,
+    "name": "Jonas Meyer",
+    "email": "jonas.meyer@example.com",
+    "company": "Blue Reed Yoga",
+    "role": null,
+    "request_type": "pricing",
+    "urgency": 1,
+    "summary": "Small yoga studio asks for pricing with online booking and class packs."
+  },
+  {
+    "id": 10,
+    "is_lead": true,
+    "name": "Kirsten Aalto",
+    "email": "info@example.com",
+    "company": "Calm Haven Spa",
+    "role": null,
+    "request_type": "demo",
+    "urgency": 1,
+    "summary": "Spa with six treatment rooms asks for a demo and a call to arrange a time."
+  },
+  {
+    "id": 11,
+    "is_lead": true,
+    "name": "Bram Jansen",
+    "email": "bram.jansen@example.com",
+    "company": "Vitaal Noord",
+    "role": null,
+    "request_type": "pricing",
+    "urgency": 1,
+    "summary": "Company with 15 staff asks the monthly price and any setup costs for appointments and invoicing."
+  },
+  {
+    "id": 12,
+    "is_lead": false
+  },
+  {
+    "id": 13,
+    "is_lead": true,
+    "name": "Rui Santos",
+    "email": "rui.santos@example.com",
+    "company": "Santos Pilates",
+    "role": null,
+    "request_type": "demo",
+    "urgency": 1,
+    "summary": "Pilates studio owner, forwarded by a colleague, wants a demo of booking and payments."
+  },
+  {
+    "id": 14,
+    "is_lead": true,
+    "name": "Gareth Moss",
+    "email": "gareth.moss@example.com",
+    "company": null,
+    "role": null,
+    "request_type": "pricing",
+    "urgency": 1,
+    "summary": "Very short message asking how much it costs."
+  },
+  {
+    "id": 15,
+    "is_lead": true,
+    "name": "Nadia Haddad",
+    "email": "nadia.haddad@example.com",
+    "company": "Glow Up Studios",
+    "role": null,
+    "request_type": "partnership",
+    "urgency": 1,
+    "summary": "Recovery products seller suggests bundling or cross-promoting to shared gym customers."
+  },
+  {
+    "id": 16,
+    "is_lead": true,
+    "name": "Jonas Meyer",
+    "email": "jonas.meyer@example.com",
+    "company": "Blue Reed Yoga",
+    "role": null,
+    "request_type": "pricing",
+    "urgency": 3,
+    "summary": "Chasing an unanswered pricing request and needs prices as soon as possible to decide this week."
+  },
+  {
+    "id": 17,
+    "is_lead": true,
+    "name": "Fleur Bakker",
+    "email": "fleur.bakker@example.com",
+    "company": "Studio Aan Zee",
+    "role": null,
+    "request_type": "demo",
+    "urgency": 1,
+    "summary": "Yoga studio asks for an online demo, suggesting next Thursday or Friday."
+  },
+  {
+    "id": 18,
+    "is_lead": false
+  },
+  {
+    "id": 19,
+    "is_lead": true,
+    "name": "Camille Dupont",
+    "email": "camille.dupont@example.com",
+    "company": "Dupont Santé",
+    "role": "Clinic Manager",
+    "request_type": "pricing",
+    "urgency": 3,
+    "summary": "Manager of a 12-person clinic, forwarded by an assistant, asks monthly cost and trial and decides on Friday."
+  },
+  {
+    "id": 20,
+    "is_lead": true,
+    "name": "Ivan Petrov",
+    "email": "ivan.petrov@example.com",
+    "company": null,
+    "role": null,
+    "request_type": "demo",
+    "urgency": 1,
+    "summary": "Almost empty email, only the subject 'Demo?' hints at a demo request."
+  },
+  {
+    "id": 21,
+    "is_lead": true,
+    "name": "Margaret Osei",
+    "email": "margaret.osei@example.com",
+    "company": "Meridian Health Network",
+    "role": "Head of Partnerships",
+    "request_type": "partnership",
+    "urgency": 1,
+    "summary": "Health network wants a preferred partner listing, member discount and integration, with an intro call within a month."
+  },
+  {
+    "id": 22,
+    "is_lead": false
+  },
+  {
+    "id": 23,
+    "is_lead": true,
+    "name": "Dan Okafor",
+    "email": "dan.okafor@freemail.example.com",
+    "company": null,
+    "role": null,
+    "request_type": "pricing",
+    "urgency": 1,
+    "summary": "Planning a small home massage business and asks the monthly cost and about a free trial."
+  },
+  {
+    "id": 24,
+    "is_lead": false
+  },
+  {
+    "id": 25,
+    "is_lead": true,
+    "name": "Sofia Marchetti",
+    "email": "sofia.marchetti@example.com",
+    "company": "Saffron Retreat Centre",
+    "role": null,
+    "request_type": "demo",
+    "urgency": 2,
+    "summary": "Retreat centre asks if rooms and sessions can both be booked, wants a demo and decides by year end."
+  },
+  {
+    "id": 26,
+    "is_lead": true,
+    "name": "Nisha Perera",
+    "email": "nisha.perera@example.com",
+    "company": "Maple Lane Interiors",
+    "role": null,
+    "request_type": "demo",
+    "urgency": 1,
+    "summary": "Company with about 25 staff wants a quick demo and cost options for a wellbeing programme."
+  },
+  {
+    "id": 27,
+    "is_lead": true,
+    "name": "Adam Silva",
+    "email": "adam.silva@example.com",
+    "company": null,
+    "role": null,
+    "request_type": "other",
+    "urgency": 1,
+    "summary": "Referred by someone and asks for general details on what Nova Wellness offers."
+  },
+  {
+    "id": 28,
+    "is_lead": true,
+    "name": "Sara Fernando",
+    "email": "sara.fernando@example.com",
+    "company": "Little Grove Events",
+    "role": null,
+    "request_type": "partnership",
+    "urgency": 1,
+    "summary": "Events company asks about working together on staff wellbeing sessions, no confirmed event yet."
+  },
+  {
+    "id": 29,
+    "is_lead": false
+  },
+  {
+    "id": 30,
+    "is_lead": true,
+    "name": "Maya Dias",
+    "email": "maya.dias@example.com",
+    "company": "Willow Bay Trading",
+    "role": null,
+    "request_type": "pricing",
+    "urgency": 3,
+    "summary": "Still waiting for a quote for a 40-person workshop and needs it by 3 pm today."
+  }
+]

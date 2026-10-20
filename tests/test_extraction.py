@@ -1,0 +1,730 @@
+"""Pretend-data checks for workflows/02-email-to-attio/extract_leads.py.
+
+These follow tests/cases/02-extraction.md (which is not changed).
+Everything here is fake and self-contained:
+  - a pretend Gemini answers in place of the real one,
+  - the internet is blocked, so nothing can leave this computer,
+  - .env is swapped for a throwaway file, and any attempt to touch the real
+    .env stops the test with an error (the real file is never opened),
+  - scores, results and prompts are written to a throwaway folder, never to
+    the real accuracy.md or the real prompts folder.
+
+Run:  python tests\\test_extraction.py
+"""
+
+import io
+import json
+import os
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import requests
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "workflows" / "02-email-to-attio"))
+
+import extract_leads  # noqa: E402
+
+REAL_ENV = (PROJECT_ROOT / ".env").resolve()
+REAL_EMAILS = PROJECT_ROOT / "tests" / "cases" / "lead-emails.md"
+REAL_EXPECTED = PROJECT_ROOT / "tests" / "cases" / "expected-results.json"
+
+FAKE_KEY = "FAKE-GEMINI-KEY-SECRET"
+FAKE_FILE_KEY = "FAKE-GEMINI-KEY-FROM-FILE-SECRET"
+FAKE_ENV = {"GEMINI_API_KEY": FAKE_KEY}
+SECRETS = (FAKE_KEY, FAKE_FILE_KEY)
+ANSWER_KEY_MARKER = "SECRET-ANSWER-KEY-MARKER"
+
+# Three small emails taken from the real set (ids 9, 5 and 4), with their answers.
+TINY_EMAILS = """# Tiny test set
+
+-----
+
+## Email 9
+From: Jonas Meyer <jonas.meyer@example.com>
+Subject: Pricing request
+Body:
+Hello, could you send me your pricing for a small studio? Thanks, Jonas Meyer, Blue Reed Yoga
+
+-----
+
+## Email 5
+From: Hannah Brooks <hannah.brooks@example.com>
+Subject: Automatic reply: Re: Nova Wellness intro
+Body:
+I am out of the office until Tuesday 3 November with limited access to email.
+
+-----
+
+## Email 4
+From: Darius Kowalski <darius.kowalski@example.com>
+Subject: NEED A DEMO THIS WEEK!!!
+Body:
+OUR BOOKING SYSTEM STOPS WORKING ON FRIDAY. THIS IS URGENT. DARIUS KOWALSKI, OWNER, IRONWORKS GYM
+"""
+
+JONAS = {
+    "is_lead": True,
+    "name": "Jonas Meyer",
+    "email": "jonas.meyer@example.com",
+    "company": "Blue Reed Yoga",
+    "role": None,
+    "request_type": "pricing",
+    "urgency": 1,
+    "summary": "Studio asks for pricing.",
+}
+DARIUS = {
+    "is_lead": True,
+    "name": "Darius Kowalski",
+    "email": "darius.kowalski@example.com",
+    "company": "Ironworks Gym",
+    "role": "Owner",
+    "request_type": "demo",
+    "urgency": 3,
+    "summary": "Urgent demo request.",
+}
+HANNAH = {"is_lead": False}
+
+TINY_EXPECTED = [
+    {"id": 9, **JONAS, "summary": ANSWER_KEY_MARKER},
+    {"id": 5, **HANNAH},
+    {"id": 4, **DARIUS},
+]
+
+# Markers that appear in each tiny email, so the pretend Gemini knows which one it was sent.
+JONAS_MARKER = "Jonas Meyer"
+HANNAH_MARKER = "out of the office"
+DARIUS_MARKER = "NEED A DEMO"
+
+
+def good_replies():
+    """What a perfect model would say for the three tiny emails."""
+    return {
+        JONAS_MARKER: json.dumps(JONAS),
+        HANNAH_MARKER: json.dumps(HANNAH),
+        DARIUS_MARKER: json.dumps(DARIUS),
+    }
+
+
+class Raise:
+    """The pretend Gemini fails with this error instead of answering."""
+
+    def __init__(self, error):
+        self.error = error
+
+
+class Status:
+    """The pretend Gemini answers with an error status instead of a result."""
+
+    def __init__(self, code, message="pretend error"):
+        self.code = code
+        self.message = message
+
+
+class FakeHTTP:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+        self.text = json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+class PretendGemini:
+    """A pretend Gemini. Records every request made to it."""
+
+    def __init__(self, replies):
+        self.replies = {marker: list(r) if isinstance(r, list) else [r] for marker, r in replies.items()}
+        self.calls = []
+
+    def post(self, url, headers=None, json=None, timeout=None, **kwargs):
+        headers = headers or {}
+        prompt_text = json["contents"][0]["parts"][0]["text"]
+        self.calls.append({"url": url, "headers": headers, "text": prompt_text})
+
+        if headers.get("x-goog-api-key") not in (FAKE_KEY, FAKE_FILE_KEY):
+            return FakeHTTP(400, {"error": {
+                "code": 400,
+                "message": "API key not valid. Please pass a valid API key.",
+                "status": "INVALID_ARGUMENT",
+            }})
+
+        for marker, queue in self.replies.items():
+            if marker in prompt_text:
+                reply = queue.pop(0) if len(queue) > 1 else queue[0]
+                break
+        else:
+            raise AssertionError("the pretend Gemini was sent an email it knows nothing about")
+
+        if isinstance(reply, Raise):
+            raise reply.error
+        if isinstance(reply, Status):
+            return FakeHTTP(reply.code, {"error": {"code": reply.code, "message": reply.message}})
+        return FakeHTTP(200, {"candidates": [{"content": {"parts": [{"text": reply}]}}]})
+
+    def texts(self):
+        return [c["text"] for c in self.calls]
+
+
+def touches_real_env(path):
+    return str(Path(path).resolve()).lower().startswith(str(REAL_ENV).lower())
+
+
+def score(expected, answers):
+    return extract_leads.score_results(expected, answers)
+
+
+class ExtractionTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+        # Throwaway .env in place of the real one.
+        self.env_path = self.tmp / ".env"
+        self.env_path.write_text("OTHER=1\n", encoding="utf-8")
+        self.assertFalse(touches_real_env(self.env_path))
+
+        # Throwaway config, prompts, test data and output places.
+        self.config_path = self.tmp / "config.json"
+        self.config_path.write_text(json.dumps({"model": "fake-model-a"}), encoding="utf-8")
+        self.prompts_dir = self.tmp / "prompts"
+        self.prompts_dir.mkdir()
+        (self.prompts_dir / "v1.md").write_text("PROMPT-V1: read the email and answer in JSON.", encoding="utf-8")
+        (self.prompts_dir / "v2.md").write_text("PROMPT-V2: read the email carefully.", encoding="utf-8")
+        self.emails_path = self.tmp / "emails.md"
+        self.emails_path.write_text(TINY_EMAILS, encoding="utf-8")
+        self.expected_path = self.tmp / "expected.json"
+        self.expected_path.write_text(json.dumps(TINY_EXPECTED), encoding="utf-8")
+        self.results_dir = self.tmp / "results"
+        self.accuracy_path = self.tmp / "accuracy.md"
+
+        for name, value in (
+            ("ENV_PATH", self.env_path),
+            ("CONFIG_PATH", self.config_path),
+            ("PROMPTS_DIR", self.prompts_dir),
+            ("EMAILS_PATH", self.emails_path),
+            ("EXPECTED_PATH", self.expected_path),
+            ("RESULTS_DIR", self.results_dir),
+            ("ACCURACY_PATH", self.accuracy_path),
+        ):
+            patcher = mock.patch.object(extract_leads, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        # Tripwires: any attempt to read or change the real .env fails the test.
+        def guard(original):
+            def wrapper(path, *args, **kwargs):
+                if touches_real_env(path):
+                    raise AssertionError("TEST SAFETY: the real .env must not be touched")
+                return original(path, *args, **kwargs)
+            return wrapper
+
+        for name in ("read_bytes", "write_bytes", "read_text", "write_text", "unlink"):
+            patcher = mock.patch.object(Path, name, guard(getattr(Path, name)))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        real_replace = os.replace
+
+        def guarded_replace(src, dst, *args, **kwargs):
+            if touches_real_env(src) or touches_real_env(dst):
+                raise AssertionError("TEST SAFETY: the real .env must not be touched")
+            return real_replace(src, dst, *args, **kwargs)
+
+        patcher = mock.patch.object(os, "replace", guarded_replace)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # Block the real internet completely.
+        import socket
+
+        def no_network(*args, **kwargs):
+            raise AssertionError("TEST SAFETY: the internet is blocked in these tests")
+
+        patcher = mock.patch.object(socket.socket, "connect", no_network)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # Never really wait. Every wait the script asks for is written down instead.
+        self.sleeps = []
+        patcher = mock.patch("time.sleep", self.sleeps.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_main(self, world, argv=(), remove=()):
+        """Run the script's main() against a pretend Gemini. Returns (code, output)."""
+        buffer = io.BytesIO()
+        out = io.TextIOWrapper(buffer, encoding="utf-8", write_through=True)
+        with mock.patch.dict(os.environ, FAKE_ENV), \
+                mock.patch.object(sys, "argv", ["extract_leads.py", *argv]), \
+                mock.patch.object(sys, "stdout", out), \
+                mock.patch("requests.post", world.post):
+            for name in remove:
+                os.environ.pop(name, None)
+            code = extract_leads.main()
+        output = buffer.getvalue().decode("utf-8")
+        for secret in SECRETS:
+            self.assertNotIn(secret, output, "a key was printed on screen")
+            for call in world.calls:
+                self.assertNotIn(secret, call["url"], "a key was put in the web address")
+        self.assertNotIn(ANSWER_KEY_MARKER, " ".join(world.texts()), "the answer key was sent to the model")
+        self.assertNotIn(FAKE_KEY, self.saved_text(), "a key was saved to a file")
+        self.assertNotIn(FAKE_FILE_KEY, self.saved_text(), "a key was saved to a file")
+        return code, output
+
+    def saved_text(self):
+        """Everything the script saved (results and scores), except the throwaway .env."""
+        parts = []
+        for path in self.tmp.rglob("*"):
+            if path.is_file() and path.name != ".env" and path.parent != self.prompts_dir:
+                if path not in (self.config_path, self.emails_path, self.expected_path):
+                    parts.append(path.read_text(encoding="utf-8"))
+        return "\n".join(parts)
+
+    def result_files_text(self):
+        if not self.results_dir.exists():
+            return ""
+        return "\n".join(p.read_text(encoding="utf-8") for p in self.results_dir.rglob("*") if p.is_file())
+
+    # ---- Reading the real test data ---------------------------------------
+
+    def test_real_email_file_gives_30_numbered_emails(self):
+        emails = extract_leads.parse_emails(REAL_EMAILS.read_text(encoding="utf-8"))
+        self.assertEqual([e["id"] for e in emails], list(range(1, 31)))
+        for e in emails:
+            self.assertTrue(e["text"].lstrip().startswith("From:"))
+            self.assertNotIn("-----", e["text"])
+        by_id = {e["id"]: e["text"] for e in emails}
+        self.assertIn("Jonas Meyer", by_id[9])
+        self.assertIn("Subject: Demo?", by_id[20])
+
+    # ---- Case 1: a normal lead email returns valid JSON -------------------
+
+    def test_case1_good_reply_scores_all_seven_fields_correct(self):
+        world = PretendGemini({JONAS_MARKER: json.dumps(JONAS)})
+        self.emails_path.write_text(TINY_EMAILS.split("## Email 5")[0], encoding="utf-8")
+        self.expected_path.write_text(json.dumps([TINY_EXPECTED[0]]), encoding="utf-8")
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        self.assertIn("7 of 7", output)
+        self.assertIn("100.0%", output)
+
+    def test_case1_prompt_and_email_are_sent_to_the_model(self):
+        world = PretendGemini(good_replies())
+        self.run_main(world, ["--live"])
+        self.assertEqual(len(world.calls), 3)
+        self.assertIn("PROMPT-V1", world.texts()[0])
+        self.assertIn("Blue Reed Yoga", world.texts()[0])
+
+    def test_case1_the_key_is_sent_in_a_header_not_the_address(self):
+        world = PretendGemini(good_replies())
+        self.run_main(world, ["--live"])
+        self.assertEqual(world.calls[0]["headers"].get("x-goog-api-key"), FAKE_KEY)
+
+    def test_case1_reply_wrapped_in_code_fences_or_chat_is_still_read(self):
+        fenced = "```json\n" + json.dumps(JONAS) + "\n```"
+        chatty = "Sure, here it is: " + json.dumps(DARIUS) + " Hope that helps!"
+        world = PretendGemini({
+            JONAS_MARKER: fenced,
+            HANNAH_MARKER: json.dumps(HANNAH),
+            DARIUS_MARKER: chatty,
+        })
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        self.assertIn("15 of 15", output)
+
+    # ---- Case 2: a non-lead email -----------------------------------------
+
+    def test_case2_non_lead_scores_one_correct_field(self):
+        world = PretendGemini({HANNAH_MARKER: json.dumps(HANNAH)})
+        self.emails_path.write_text("## Email 5\n" + TINY_EMAILS.split("## Email 5\n")[1].split("-----")[0], encoding="utf-8")
+        self.expected_path.write_text(json.dumps([TINY_EXPECTED[1]]), encoding="utf-8")
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        self.assertIn("1 of 1", output)
+
+    def test_case2_extra_fields_on_a_non_lead_are_ignored(self):
+        result = score(
+            [{"id": 5, "is_lead": False}],
+            {5: {"is_lead": False, "name": "Hannah", "urgency": 3}},
+        )
+        self.assertEqual((result["correct"], result["total"]), (1, 1))
+
+    # ---- Case 3: wrong is_lead on a real lead -----------------------------
+
+    def test_case3_wrong_is_lead_makes_all_seven_fields_wrong(self):
+        result = score([{"id": 4, **DARIUS}], {4: {"is_lead": False}})
+        self.assertEqual((result["correct"], result["total"]), (0, 7))
+
+    def test_case3_non_lead_wrongly_called_a_lead_loses_only_is_lead(self):
+        result = score([{"id": 5, **HANNAH}], {5: dict(DARIUS)})
+        self.assertEqual((result["correct"], result["total"]), (0, 1))
+
+    # ---- Case 4: the model returns broken JSON ----------------------------
+
+    def test_case4_broken_json_counts_as_wrong_and_does_not_crash(self):
+        world = PretendGemini({
+            JONAS_MARKER: "Sorry, I can only chat about yoga.",
+            HANNAH_MARKER: json.dumps(HANNAH),
+            DARIUS_MARKER: json.dumps(DARIUS),
+        })
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(world.calls), 3, "it should carry on with the next email")
+        self.assertIn("8 of 15", output)
+        self.assertIn("Broken replies: 1", output)
+        self.assertNotIn("Traceback", output)
+
+    def test_case4_cut_off_json_is_broken(self):
+        world = PretendGemini({
+            JONAS_MARKER: '{"is_lead": tr',
+            HANNAH_MARKER: json.dumps(HANNAH),
+            DARIUS_MARKER: json.dumps(DARIUS),
+        })
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        self.assertIn("Broken replies: 1", output)
+
+    def test_case4_a_list_instead_of_an_object_is_broken(self):
+        world = PretendGemini({
+            JONAS_MARKER: "[1, 2, 3]",
+            HANNAH_MARKER: json.dumps(HANNAH),
+            DARIUS_MARKER: json.dumps(DARIUS),
+        })
+        code, output = self.run_main(world, ["--live"])
+        self.assertIn("Broken replies: 1", output)
+
+    def test_case4_the_broken_reply_is_saved_for_reading_later(self):
+        world = PretendGemini({
+            JONAS_MARKER: "Sorry, I can only chat about yoga.",
+            HANNAH_MARKER: json.dumps(HANNAH),
+            DARIUS_MARKER: json.dumps(DARIUS),
+        })
+        self.run_main(world, ["--live"])
+        self.assertIn("Sorry, I can only chat about yoga.", self.result_files_text())
+
+    def test_case4_a_missing_field_counts_as_wrong_not_broken(self):
+        reply = {k: v for k, v in JONAS.items() if k != "role"}
+        world = PretendGemini({
+            JONAS_MARKER: json.dumps(reply),
+            HANNAH_MARKER: json.dumps(HANNAH),
+            DARIUS_MARKER: json.dumps(DARIUS),
+        })
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        self.assertIn("14 of 15", output)
+        self.assertIn("Broken replies: 0", output)
+
+    # ---- Case 5: the model or internet cannot be reached ------------------
+
+    def test_case5_no_internet_stops_with_a_plain_message(self):
+        world = PretendGemini({JONAS_MARKER: Raise(requests.exceptions.ConnectionError("down"))})
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't reach the AI service", output)
+        self.assertNotIn("ConnectionError", output)
+        self.assertNotIn("Traceback", output)
+
+    def test_case5_no_half_finished_score_is_saved(self):
+        world = PretendGemini({JONAS_MARKER: Raise(requests.exceptions.ConnectionError("down"))})
+        self.run_main(world, ["--live"])
+        self.assertFalse(self.accuracy_path.exists())
+        self.assertEqual(len(world.calls), 1, "it should stop straight away")
+
+    def test_case5_a_timeout_is_treated_the_same_way(self):
+        world = PretendGemini({JONAS_MARKER: Raise(requests.exceptions.Timeout("slow"))})
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't reach the AI service", output)
+        self.assertFalse(self.accuracy_path.exists())
+
+    def test_case5_a_gemini_server_error_is_treated_as_unreachable(self):
+        world = PretendGemini({JONAS_MARKER: Status(503, "overloaded")})
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't reach the AI service", output)
+        self.assertFalse(self.accuracy_path.exists())
+
+    # ---- Case 6: the free limit is reached --------------------------------
+
+    def test_case6_one_limit_hit_waits_and_tries_again(self):
+        replies = good_replies()
+        replies[JONAS_MARKER] = [Status(429, "slow down"), json.dumps(JONAS)]
+        world = PretendGemini(replies)
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        self.assertIn(extract_leads.RETRY_WAIT_SECONDS, self.sleeps)
+        self.assertEqual(len([t for t in world.texts() if JONAS_MARKER in t]), 2)
+        self.assertIn("15 of 15", output)
+
+    def test_case6_still_limited_after_the_retry_stops_with_a_plain_message(self):
+        replies = good_replies()
+        replies[JONAS_MARKER] = Status(429, "slow down")
+        world = PretendGemini(replies)
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 1)
+        self.assertIn("free limit", output)
+        self.assertEqual(len([t for t in world.texts() if JONAS_MARKER in t]), 2, "one try plus one retry")
+        self.assertFalse(self.accuracy_path.exists())
+        self.assertNotIn("Traceback", output)
+
+    # ---- Case 7: GEMINI_API_KEY is missing --------------------------------
+
+    def test_case7_missing_key_stops_before_any_call(self):
+        world = PretendGemini(good_replies())
+        before = self.env_path.read_text(encoding="utf-8")
+        code, output = self.run_main(world, ["--live"], remove=["GEMINI_API_KEY"])
+        self.assertEqual(code, 1)
+        self.assertIn("I can't find GEMINI_API_KEY", output)
+        self.assertIn("Add it to your .env file", output)
+        self.assertEqual(world.calls, [])
+        self.assertEqual(self.env_path.read_text(encoding="utf-8"), before)
+        self.assertFalse(self.accuracy_path.exists())
+
+    def test_case7_key_found_only_in_the_env_file_still_works(self):
+        self.env_path.write_text(f"OTHER=1\nGEMINI_API_KEY={FAKE_FILE_KEY}\n", encoding="utf-8")
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, ["--live"], remove=["GEMINI_API_KEY"])
+        self.assertEqual(code, 0)
+        self.assertEqual(world.calls[0]["headers"].get("x-goog-api-key"), FAKE_FILE_KEY)
+
+    def test_case7_the_env_file_is_never_changed(self):
+        self.env_path.write_text(f"OTHER=1\nGEMINI_API_KEY={FAKE_FILE_KEY}\n", encoding="utf-8")
+        before = self.env_path.read_bytes()
+        world = PretendGemini(good_replies())
+        self.run_main(world, ["--live"], remove=["GEMINI_API_KEY"])
+        self.assertEqual(self.env_path.read_bytes(), before)
+
+    # ---- Case 8: Gemini rejects the key -----------------------------------
+
+    def test_case8_rejected_key_stops_with_a_plain_message(self):
+        world = PretendGemini({JONAS_MARKER: Status(403, "permission denied")})
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 1)
+        self.assertIn("Gemini did not accept the key", output)
+        self.assertFalse(self.accuracy_path.exists())
+
+    def test_case8_a_wrong_key_value_is_caught_and_never_shown(self):
+        world = PretendGemini(good_replies())
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "WRONG-KEY-VALUE-SECRET"}):
+            buffer = io.BytesIO()
+            out = io.TextIOWrapper(buffer, encoding="utf-8", write_through=True)
+            with mock.patch.object(sys, "argv", ["extract_leads.py", "--live"]), \
+                    mock.patch.object(sys, "stdout", out), \
+                    mock.patch("requests.post", world.post):
+                code = extract_leads.main()
+        output = buffer.getvalue().decode("utf-8")
+        self.assertEqual(code, 1)
+        self.assertIn("Gemini did not accept the key", output)
+        self.assertNotIn("WRONG-KEY-VALUE-SECRET", output)
+        self.assertNotIn("WRONG-KEY-VALUE-SECRET", self.saved_text())
+        for call in world.calls:
+            self.assertNotIn("WRONG-KEY-VALUE-SECRET", call["url"])
+
+    # ---- Case 9: scoring maths on a tiny example --------------------------
+
+    def test_case9_tiny_example_is_13_of_15(self):
+        expected = [
+            {"id": 1, **DARIUS},
+            {"id": 2, **JONAS},
+            {"id": 3, **HANNAH},
+        ]
+        answers = {
+            1: dict(DARIUS),
+            2: dict(JONAS, urgency=3, role="Owner"),
+            3: {"is_lead": False},
+        }
+        result = score(expected, answers)
+        self.assertEqual(result["total"], 15)
+        self.assertEqual(result["correct"], 13)
+        self.assertAlmostEqual(result["accuracy"], 13 / 15)
+        self.assertEqual(round(result["accuracy"] * 100, 1), 86.7)
+
+    def test_case9_summary_is_never_counted(self):
+        a = score([{"id": 1, **DARIUS}], {1: dict(DARIUS, summary="Totally different words")})
+        b = score([{"id": 1, **DARIUS}], {1: dict(DARIUS)})
+        self.assertEqual((a["correct"], a["total"]), (7, 7))
+        self.assertEqual((b["correct"], b["total"]), (7, 7))
+        self.assertNotIn("summary", a["per_field"])
+
+    def test_case9_score_for_each_field_is_reported(self):
+        expected = [{"id": 1, **DARIUS}, {"id": 2, **JONAS}]
+        answers = {1: dict(DARIUS), 2: dict(JONAS, urgency=3)}
+        result = score(expected, answers)
+        self.assertEqual(result["per_field"]["urgency"], (1, 2))
+        self.assertEqual(result["per_field"]["name"], (2, 2))
+        self.assertEqual(result["per_field"]["is_lead"], (2, 2))
+
+    # ---- Case 10: scored fields on the full set ---------------------------
+
+    def test_case10_full_answer_key_has_174_scored_fields(self):
+        expected = json.loads(REAL_EXPECTED.read_text(encoding="utf-8"))
+        self.assertEqual(len(expected), 30)
+        self.assertEqual(sum(1 for e in expected if e["is_lead"]), 24)
+        perfect = {e["id"]: {k: v for k, v in e.items() if k != "id"} for e in expected}
+        result = score(expected, perfect)
+        self.assertEqual(result["total"], 174)
+        self.assertEqual(result["correct"], 174)
+        self.assertEqual(result["accuracy"], 1.0)
+
+    # ---- Case 11: capitals and spaces -------------------------------------
+
+    def one_field(self, expected_lead, field, model_value):
+        answer = dict(expected_lead)
+        answer[field] = model_value
+        result = score([{"id": 1, **expected_lead}], {1: answer})
+        return result["per_field"][field]
+
+    def test_case11_capitals_and_edge_spaces_are_ignored(self):
+        self.assertEqual(self.one_field(DARIUS, "name", "DARIUS KOWALSKI "), (1, 1))
+        self.assertEqual(self.one_field(DARIUS, "name", "  darius kowalski"), (1, 1))
+        self.assertEqual(self.one_field(DARIUS, "company", "IRONWORKS GYM"), (1, 1))
+
+    def test_case11_a_different_spelling_is_wrong(self):
+        self.assertEqual(self.one_field(DARIUS, "name", "Darius Kowalsky"), (0, 1))
+        self.assertEqual(self.one_field(DARIUS, "name", "Darius  Kowalski"), (0, 1), "spaces inside the name still matter")
+
+    def test_case11_null_is_only_matched_by_null(self):
+        self.assertEqual(self.one_field(JONAS, "role", None), (1, 1))
+        for wrong in ("null", "None", "none", "", " ", "N/A"):
+            with self.subTest(value=wrong):
+                self.assertEqual(self.one_field(JONAS, "role", wrong), (0, 1))
+
+    def test_case11_a_real_value_where_null_was_expected_is_wrong(self):
+        self.assertEqual(self.one_field(JONAS, "company", None), (0, 1))
+        self.assertEqual(self.one_field(JONAS, "role", "Owner"), (0, 1))
+
+    def test_case11_request_type_and_urgency_must_match_exactly(self):
+        self.assertEqual(self.one_field(JONAS, "request_type", "Pricing "), (1, 1))
+        self.assertEqual(self.one_field(JONAS, "request_type", "demo"), (0, 1))
+        self.assertEqual(self.one_field(DARIUS, "urgency", 3), (1, 1))
+        self.assertEqual(self.one_field(DARIUS, "urgency", 2), (0, 1))
+
+    # ---- Case 12: each prompt version keeps its own score -----------------
+
+    def test_case12_a_live_run_adds_one_row_to_accuracy_md(self):
+        world = PretendGemini(good_replies())
+        self.run_main(world, ["--live"])
+        text = self.accuracy_path.read_text(encoding="utf-8")
+        rows = [line for line in text.splitlines() if re.match(r"\|\s*20\d\d-\d\d-\d\d", line)]
+        self.assertEqual(len(rows), 1)
+        self.assertIn("v1", rows[0])
+        self.assertIn("fake-model-a", rows[0])
+        self.assertIn("100.0%", rows[0])
+        for field in ("is_lead", "name", "email", "company", "role", "request_type", "urgency"):
+            self.assertIn(field, text)
+
+    def test_case12_second_prompt_version_keeps_the_first_row(self):
+        world = PretendGemini(good_replies())
+        self.run_main(world, ["--live", "--prompt", "v1"])
+        replies = good_replies()
+        replies[JONAS_MARKER] = json.dumps(dict(JONAS, urgency=3))
+        world2 = PretendGemini(replies)
+        self.run_main(world2, ["--live", "--prompt", "v2"])
+        text = self.accuracy_path.read_text(encoding="utf-8")
+        rows = [line for line in text.splitlines() if re.match(r"\|\s*20\d\d-\d\d-\d\d", line)]
+        self.assertEqual(len(rows), 2)
+        self.assertIn("v1", rows[0])
+        self.assertIn("100.0%", rows[0])
+        self.assertIn("v2", rows[1])
+        self.assertIn("93.3%", rows[1])
+        self.assertIn("PROMPT-V2", world2.texts()[0])
+        self.assertNotIn("PROMPT-V1", world2.texts()[0])
+
+    def test_case12_an_unknown_prompt_version_is_explained(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, ["--live", "--prompt", "v9"])
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't find the prompt file", output)
+        self.assertIn("v9", output)
+        self.assertEqual(world.calls, [])
+
+    # ---- Case 13: switching models is a one-line change -------------------
+
+    def test_case13_dry_run_shows_the_model_name_from_the_config(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, [])
+        self.assertEqual(code, 0)
+        self.assertIn("fake-model-a", output)
+
+    def test_case13_changing_the_config_changes_the_model_used(self):
+        world = PretendGemini(good_replies())
+        self.run_main(world, ["--live"])
+        self.assertIn("fake-model-a", world.calls[0]["url"])
+
+        self.config_path.write_text(json.dumps({"model": "fake-model-b"}), encoding="utf-8")
+        world2 = PretendGemini(good_replies())
+        self.run_main(world2, ["--live"])
+        self.assertIn("fake-model-b", world2.calls[0]["url"])
+        self.assertNotIn("fake-model-a", world2.calls[0]["url"])
+
+    def test_case13_the_model_name_is_saved_with_the_score(self):
+        self.config_path.write_text(json.dumps({"model": "fake-model-b"}), encoding="utf-8")
+        world = PretendGemini(good_replies())
+        self.run_main(world, ["--live"])
+        self.assertIn("fake-model-b", self.accuracy_path.read_text(encoding="utf-8"))
+
+    def test_a_broken_config_is_explained_before_anything_happens(self):
+        self.config_path.write_text("{}", encoding="utf-8")
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 1)
+        self.assertIn("model", output)
+        self.assertIn("config.json", output)
+        self.assertEqual(world.calls, [])
+
+    # ---- Default behaviour ------------------------------------------------
+
+    def test_default_is_a_dry_run_that_makes_no_calls_and_saves_nothing(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, [])
+        self.assertEqual(code, 0)
+        self.assertIn("Dry run", output)
+        self.assertEqual(world.calls, [])
+        self.assertFalse(self.accuracy_path.exists())
+        self.assertFalse(self.results_dir.exists())
+
+    def test_dry_run_shows_prompt_version_model_and_the_first_email(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, ["--prompt", "v2"])
+        self.assertIn("v2", output)
+        self.assertIn("fake-model-a", output)
+        self.assertIn("3 emails", output)
+        self.assertIn("would send", output)
+        self.assertIn("Pricing request", output)
+        self.assertIn("PROMPT-V2", output)
+
+    def test_dry_run_works_without_the_key(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, [], remove=["GEMINI_API_KEY"])
+        self.assertEqual(code, 0)
+        self.assertIn("Dry run", output)
+        self.assertEqual(world.calls, [])
+
+    # ---- Other safety checks ----------------------------------------------
+
+    def test_a_pause_is_taken_between_calls(self):
+        world = PretendGemini(good_replies())
+        self.run_main(world, ["--live"])
+        self.assertGreaterEqual(self.sleeps.count(extract_leads.PAUSE_SECONDS), 2)
+
+    def test_the_final_report_shows_the_score_in_plain_words(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, ["--live"])
+        self.assertIn("Accuracy: 100.0% (15 of 15 fields correct)", output)
+
+    def test_the_real_env_is_never_opened_by_a_normal_run(self):
+        # The tripwires in setUp raise an error if the real .env is touched.
+        world = PretendGemini(good_replies())
+        code, _ = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
