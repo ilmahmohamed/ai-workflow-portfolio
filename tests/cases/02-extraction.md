@@ -90,6 +90,70 @@ No real keys appear in this file.
 - Expected: the next run uses the new model, and the dry run output shows its name.
 - Expected: nothing else needs to change.
 
+## Case 14: a different set of emails
+
+- Input: --emails and --answers point at another email file and answer key (for example ids 201 and 202).
+- Expected: only the emails in that file are used. The 30 original emails are not sent.
+- Expected: the output says which email set is in use, taken from the email file's name (for example "Email set: own-emails").
+- Expected: a dry run with these options shows the number of emails in that set and the first one, and makes no calls.
+
+## Case 15: the score is worked out over that set only
+
+- Input: a set of 2 emails: one real lead and one non-lead, all answered correctly.
+- Expected: 8 scored fields (7 for the lead plus 1 for the non-lead), 8 correct, so 100.0%.
+- Input: the same set, but the urgency of the lead is wrong.
+- Expected: 7 of 8 fields correct, so 87.5%. The scoring rules are the same as for the 30 emails.
+
+## Case 16: the accuracy log keeps the sets apart
+
+- Input: a live run on the 30-email set, then a live run on another set.
+- Expected: the new row in accuracy.md has the set name in the Prompt cell, like "v2 [own-emails]".
+- Expected: the existing rows are not changed. Rows for the 30-email set have no brackets.
+- Expected: the saved replies file for the other set has the set name in its file name.
+
+## Case 17: only one of --emails and --answers
+
+- Input: --emails is given without --answers, or --answers without --emails.
+- Expected: the script stops straight away with a plain message saying the two must be used together.
+- Expected: no calls are made and nothing is saved.
+
+## Case 18: a missing or mismatched file
+
+- Input: the email file does not exist.
+- Expected: a plain message says which file could not be found. No calls are made.
+- Input: the answer file is not valid.
+- Expected: a plain message says the files could not be read. No calls are made.
+- Input: the email file and the answer file do not list the same email numbers.
+- Expected: a plain message says they don't list the same emails. No calls are made.
+- Input: a file path that is only correct from the project folder (for example tests/cases/own-emails.md).
+- Expected: it is found even when the script is started from another folder.
+
+## Case 19: --only sends a single email
+
+- Input: --live --only 9 (one email from the set).
+- Expected: only that email is sent, and there is no pause.
+- Expected: the screen shows each field with what the answer key says, what Gemini said, and "match" or "WRONG", then "N of M fields match the key".
+- Expected: nothing is added to accuracy.md and no replies file is saved.
+- Input: --only on a non-lead.
+- Expected: only is_lead is shown and scored.
+- Input: Gemini says "not a lead" for a real lead.
+- Expected: is_lead is WRONG, and the other fields are shown as "(missing)" and WRONG.
+- Input: Gemini's reply is broken.
+- Expected: the screen says the reply was broken and that every field is wrong. The script does not crash.
+- Input: --only 999 where there is no such email.
+- Expected: a plain message says it couldn't find email 999. No calls are made.
+- Input: --only without --live.
+- Expected: a dry run showing only that email's message, with no calls.
+- Input: --only together with --emails and --answers.
+- Expected: it picks the email from that other set.
+- Input: --only abc.
+- Expected: refused with a message that the id must be a whole number.
+
+## Case 20: without the new options nothing changes
+
+- Input: a normal run with none of --emails, --answers or --only.
+- Expected: it works exactly as before. All emails in the 30-email file are used, no "Email set" line is shown, and the accuracy row has no brackets.
+
 ## Default behaviour
 
 - The script runs as a dry run unless it is started with --live.

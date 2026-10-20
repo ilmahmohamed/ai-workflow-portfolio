@@ -100,6 +100,53 @@ JONAS_MARKER = "Jonas Meyer"
 HANNAH_MARKER = "out of the office"
 DARIUS_MARKER = "NEED A DEMO"
 
+# A different, tiny email set (ids 201 and 202) for the --emails / --answers options.
+WANDA = {
+    "is_lead": True,
+    "name": "Wanda Pruitt",
+    "email": "wanda.pruitt@example.com",
+    "company": "Pruitt Dance",
+    "role": None,
+    "request_type": "demo",
+    "urgency": 1,
+    "summary": "Dance studio owner asks for a demo.",
+}
+DIGEST = {"is_lead": False}
+SET_EMAILS = """# Own test set
+
+-----
+
+## Email 201
+From: Wanda Pruitt <wanda.pruitt@example.com>
+Subject: Demo please
+Body:
+Hi, I'd like a demo of Nova Wellness for my dance studio. Thanks, Wanda Pruitt, Pruitt Dance
+
+-----
+
+## Email 202
+From: Studio News <digest@example.com>
+Subject: Your Weekly Digest
+Body:
+This is your Weekly Digest. Unsubscribe at any time.
+"""
+SET_EXPECTED = [
+    {"id": 201, **WANDA, "summary": ANSWER_KEY_MARKER},
+    {"id": 202, **DIGEST},
+]
+WANDA_MARKER = "Wanda Pruitt"
+DIGEST_MARKER = "Weekly Digest"
+
+
+def set_replies():
+    """What a perfect model would say for the two emails in the other set."""
+    return {WANDA_MARKER: json.dumps(WANDA), DIGEST_MARKER: json.dumps(DIGEST)}
+
+
+def score_rows(text):
+    """The rows of the accuracy table (lines that start with a date)."""
+    return [line for line in text.splitlines() if re.match(r"\|\s*20\d\d-\d\d-\d\d", line)]
+
 
 def good_replies():
     """What a perfect model would say for the three tiny emails."""
@@ -706,6 +753,238 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Dry run", output)
         self.assertEqual(world.calls, [])
+
+    # ---- A different set of emails (--emails and --answers) ---------------
+
+    def make_set(self, name="own-emails", expected=None, folder=None):
+        """Write the tiny other set. Returns (emails_path, answers_path) as text."""
+        folder = folder or (self.tmp / "sets")
+        folder.mkdir(parents=True, exist_ok=True)
+        emails = folder / f"{name}.md"
+        emails.write_text(SET_EMAILS, encoding="utf-8")
+        answers = folder / f"{name}-expected.json"
+        answers.write_text(json.dumps(SET_EXPECTED if expected is None else expected), encoding="utf-8")
+        return str(emails), str(answers)
+
+    def set_args(self, *extra, **kwargs):
+        emails, answers = self.make_set(**kwargs)
+        return ["--emails", emails, "--answers", answers, *extra]
+
+    def test_case14_other_set_is_used_instead_of_the_30(self):
+        world = PretendGemini(set_replies())
+        code, output = self.run_main(world, ["--live", *self.set_args()])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(world.calls), 2)
+        self.assertIn("Wanda Pruitt", world.texts()[0])
+        self.assertNotIn("Jonas Meyer", " ".join(world.texts()))
+        self.assertIn("Email set: own-emails", output)
+
+    def test_case14_dry_run_shows_the_set_and_makes_no_calls(self):
+        world = PretendGemini(set_replies())
+        code, output = self.run_main(world, self.set_args())
+        self.assertEqual(code, 0)
+        self.assertIn("Dry run", output)
+        self.assertIn("Email set: own-emails", output)
+        self.assertIn("2 emails", output)
+        self.assertIn("Demo please", output)
+        self.assertEqual(world.calls, [])
+
+    def test_case14_ids_do_not_have_to_start_at_1(self):
+        world = PretendGemini(set_replies())
+        code, output = self.run_main(world, ["--live", *self.set_args()])
+        self.assertIn("Email 201: reply read", output)
+        self.assertIn("Email 202: reply read", output)
+
+    def test_case15_perfect_answers_score_8_of_8(self):
+        world = PretendGemini(set_replies())
+        code, output = self.run_main(world, ["--live", *self.set_args()])
+        self.assertIn("Accuracy: 100.0% (8 of 8 fields correct)", output)
+
+    def test_case15_one_wrong_field_scores_7_of_8(self):
+        replies = set_replies()
+        replies[WANDA_MARKER] = json.dumps(dict(WANDA, urgency=3))
+        world = PretendGemini(replies)
+        code, output = self.run_main(world, ["--live", *self.set_args()])
+        self.assertIn("Accuracy: 87.5% (7 of 8 fields correct)", output)
+
+    def test_case16_row_has_the_set_name_and_old_rows_are_untouched(self):
+        self.run_main(PretendGemini(good_replies()), ["--live"])
+        before = self.accuracy_path.read_text(encoding="utf-8")
+        first_row = score_rows(before)[0]
+
+        world = PretendGemini(set_replies())
+        self.run_main(world, ["--live", "--prompt", "v2", *self.set_args()])
+        after = self.accuracy_path.read_text(encoding="utf-8")
+
+        self.assertTrue(after.startswith(before), "the existing text must not change")
+        rows = score_rows(after)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], first_row)
+        self.assertNotIn("[", first_row)
+        self.assertIn("v2 [own-emails]", rows[1])
+        self.assertIn("(8/8)", rows[1])
+
+    def test_case16_replies_file_name_includes_the_set_name(self):
+        self.run_main(PretendGemini(good_replies()), ["--live"])
+        self.run_main(PretendGemini(set_replies()), ["--live", *self.set_args()])
+        names = sorted(p.name for p in self.results_dir.iterdir())
+        self.assertEqual(len(names), 2)
+        self.assertEqual(len([n for n in names if "own-emails" in n]), 1)
+
+    def test_case17_one_option_without_the_other_is_refused(self):
+        emails, answers = self.make_set()
+        for argv in (["--emails", emails], ["--answers", answers]):
+            with self.subTest(argv=argv[0]):
+                world = PretendGemini(set_replies())
+                code, output = self.run_main(world, ["--live", *argv])
+                self.assertEqual(code, 1)
+                self.assertIn("--emails and --answers together", output)
+                self.assertEqual(world.calls, [])
+        self.assertFalse(self.accuracy_path.exists())
+
+    def test_case18_missing_email_file_is_named(self):
+        _, answers = self.make_set()
+        missing = str(self.tmp / "sets" / "nope.md")
+        world = PretendGemini(set_replies())
+        code, output = self.run_main(world, ["--live", "--emails", missing, "--answers", answers])
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't find the file", output)
+        self.assertIn("nope.md", output)
+        self.assertEqual(world.calls, [])
+
+    def test_case18_unreadable_answer_file_is_explained(self):
+        emails, answers = self.make_set()
+        Path(answers).write_text("this is not json", encoding="utf-8")
+        world = PretendGemini(set_replies())
+        code, output = self.run_main(world, ["--live", "--emails", emails, "--answers", answers])
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't read", output)
+        self.assertEqual(world.calls, [])
+
+    def test_case18_mismatched_ids_are_explained(self):
+        emails, answers = self.make_set(expected=[SET_EXPECTED[0]])
+        world = PretendGemini(set_replies())
+        code, output = self.run_main(world, ["--live", "--emails", emails, "--answers", answers])
+        self.assertEqual(code, 1)
+        self.assertIn("don't list the same emails", output)
+        self.assertEqual(world.calls, [])
+
+    def test_case18_a_path_from_the_project_folder_is_found_from_anywhere(self):
+        self.make_set(folder=self.tmp / "own")
+        world = PretendGemini(set_replies())
+        with mock.patch.object(extract_leads, "PROJECT_ROOT", self.tmp):
+            code, output = self.run_main(
+                world,
+                ["--live", "--emails", "own/own-emails.md", "--answers", "own/own-emails-expected.json"],
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("8 of 8", output)
+
+    # ---- --only: send a single email ---------------------------------------
+
+    def test_case19_only_sends_one_email_and_shows_each_field(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, ["--live", "--only", "9"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(world.calls), 1)
+        self.assertIn("Jonas Meyer", world.texts()[0])
+        self.assertIn("Email 9", output)
+        self.assertIn('name: key "Jonas Meyer", Gemini "Jonas Meyer": match', output)
+        self.assertIn("role: key null, Gemini null: match", output)
+        self.assertIn("urgency: key 1, Gemini 1: match", output)
+        self.assertIn("7 of 7 fields match the key", output)
+        self.assertNotIn(extract_leads.PAUSE_SECONDS, self.sleeps)
+
+    def test_case19_only_saves_nothing(self):
+        world = PretendGemini(good_replies())
+        self.run_main(world, ["--live", "--only", "9"])
+        self.assertFalse(self.accuracy_path.exists())
+        self.assertFalse(self.results_dir.exists())
+
+    def test_case19_a_wrong_field_is_marked(self):
+        replies = good_replies()
+        replies[JONAS_MARKER] = json.dumps(dict(JONAS, urgency=3))
+        world = PretendGemini(replies)
+        code, output = self.run_main(world, ["--live", "--only", "9"])
+        self.assertIn("urgency: key 1, Gemini 3: WRONG", output)
+        self.assertIn("6 of 7 fields match the key", output)
+
+    def test_case19_a_non_lead_shows_only_is_lead(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, ["--live", "--only", "5"])
+        self.assertEqual(code, 0)
+        self.assertIn("is_lead: key false, Gemini false: match", output)
+        self.assertIn("1 of 1 fields match the key", output)
+        self.assertNotIn("name:", output)
+
+    def test_case19_a_real_lead_called_a_non_lead_shows_missing_fields(self):
+        replies = good_replies()
+        replies[DARIUS_MARKER] = json.dumps({"is_lead": False})
+        world = PretendGemini(replies)
+        code, output = self.run_main(world, ["--live", "--only", "4"])
+        self.assertIn("is_lead: key true, Gemini false: WRONG", output)
+        self.assertIn('name: key "Darius Kowalski", Gemini (missing): WRONG', output)
+        self.assertIn("0 of 7 fields match the key", output)
+
+    def test_case19_a_broken_reply_is_reported_without_crashing(self):
+        replies = good_replies()
+        replies[JONAS_MARKER] = "Sorry, I can only chat about yoga."
+        world = PretendGemini(replies)
+        code, output = self.run_main(world, ["--live", "--only", "9"])
+        self.assertEqual(code, 0)
+        self.assertIn("reply was broken", output)
+        self.assertIn("0 of 7 fields match the key", output)
+        self.assertNotIn("Traceback", output)
+
+    def test_case19_an_unknown_id_is_explained(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, ["--live", "--only", "999"])
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't find email 999", output)
+        self.assertEqual(world.calls, [])
+
+    def test_case19_dry_run_shows_only_that_email(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, ["--only", "9"])
+        self.assertEqual(code, 0)
+        self.assertIn("Dry run", output)
+        self.assertIn("would send", output)
+        self.assertIn("Pricing request", output)
+        self.assertNotIn("Automatic reply", output)
+        self.assertEqual(world.calls, [])
+
+    def test_case19_only_works_with_another_set(self):
+        world = PretendGemini(set_replies())
+        code, output = self.run_main(world, ["--live", "--only", "202", *self.set_args()])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(world.calls), 1)
+        self.assertIn("Weekly Digest", world.texts()[0])
+        self.assertIn("Email set: own-emails", output)
+        self.assertIn("Email 202", output)
+        self.assertIn("1 of 1 fields match the key", output)
+
+    def test_case19_an_id_that_is_not_a_number_is_refused(self):
+        world = PretendGemini(good_replies())
+        errors = io.StringIO()
+        with mock.patch.object(sys, "stderr", errors):
+            with self.assertRaises(SystemExit) as stop:
+                self.run_main(world, ["--live", "--only", "abc"])
+        self.assertNotEqual(stop.exception.code, 0)
+        self.assertIn("--only", errors.getvalue())
+        self.assertEqual(world.calls, [])
+
+    # ---- Case 20: nothing changes without the new options ------------------
+
+    def test_case20_without_the_new_options_nothing_changes(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(world.calls), 3)
+        self.assertNotIn("Email set", output)
+        self.assertIn("Accuracy: 100.0% (15 of 15 fields correct)", output)
+        rows = score_rows(self.accuracy_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("[", rows[0])
 
     # ---- Other safety checks ----------------------------------------------
 

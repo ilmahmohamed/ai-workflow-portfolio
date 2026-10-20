@@ -7,6 +7,13 @@ accuracy.md.
 
 Dry run by default: shows what would be sent and makes no calls.
 
+Options:
+  --live            really call Gemini
+  --prompt v2       use prompts/v2.md (default v1)
+  --emails FILE --answers FILE
+                    use another email file and answer key (give both)
+  --only ID         send just that one email and show how it matched the key
+
 Run:  python workflows\\02-email-to-attio\\extract_leads.py
       python workflows\\02-email-to-attio\\extract_leads.py --live --prompt v1
 Needs: GEMINI_API_KEY (in .env or set in the terminal) for --live only.
@@ -99,8 +106,19 @@ def load_prompt(version):
 
 # ---- Test data --------------------------------------------------------------
 
+def resolve_path(text):
+    """Use the path as typed; if it isn't there, try it from the project folder."""
+    path = Path(text)
+    if path.is_file():
+        return path
+    from_project = PROJECT_ROOT / text
+    if from_project.is_file():
+        return from_project
+    raise SetupProblem(f"I couldn't find the file {text}.")
+
+
 def parse_emails(text):
-    """Split lead-emails.md into [{"id": 1, "text": "From: ..."}, ...]."""
+    """Split an email file into [{"id": 1, "text": "From: ..."}, ...]."""
     heading = re.compile(r"^## Email (\d+)[ \t]*$", re.MULTILINE)
     matches = list(heading.finditer(text))
     emails = []
@@ -115,19 +133,27 @@ def parse_emails(text):
     return emails
 
 
-def load_test_data():
+def load_test_data(emails_path=None, answers_path=None):
+    """The 30 test emails and their key, unless other files are given."""
     try:
-        emails = parse_emails(EMAILS_PATH.read_text(encoding="utf-8"))
-        expected = json.loads(EXPECTED_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        emails = parse_emails((emails_path or EMAILS_PATH).read_text(encoding="utf-8"))
+        expected = json.loads((answers_path or EXPECTED_PATH).read_text(encoding="utf-8"))
+        email_ids = sorted(e["id"] for e in emails)
+        expected_ids = sorted(e["id"] for e in expected)
+        [e["is_lead"] for e in expected]
+    except (OSError, ValueError, KeyError, TypeError):
         raise SetupProblem("I couldn't read the test emails or the answer file. Nothing was changed.")
-    if sorted(e["id"] for e in emails) != sorted(e["id"] for e in expected):
+    if email_ids != expected_ids:
         raise SetupProblem("The emails file and the answer file don't list the same emails.")
     return emails, expected
 
 
 def build_message(prompt, email_text):
     return f"{prompt.strip()}\n\nHere is the email:\n\n{email_text}"
+
+
+def count_emails(number):
+    return f"{number} email" + ("" if number == 1 else "s")
 
 
 # ---- Talking to Gemini ------------------------------------------------------
@@ -242,7 +268,7 @@ def percent(value):
     return f"{value * 100:.1f}%"
 
 
-def save_score(prompt_version, model, result):
+def save_score(prompt_label, model, result):
     if not ACCURACY_PATH.exists():
         ACCURACY_PATH.write_text(
             "# Accuracy by prompt version\n\n"
@@ -253,7 +279,7 @@ def save_score(prompt_version, model, result):
         )
     per_field = "; ".join(f"{f} {c}/{t}" for f, (c, t) in result["per_field"].items())
     row = (
-        f"| {datetime.date.today().isoformat()} | {prompt_version} | {model} "
+        f"| {datetime.date.today().isoformat()} | {prompt_label} | {model} "
         f"| {percent(result['accuracy'])} ({result['correct']}/{result['total']}) "
         f"| {result['broken']} | {per_field} |\n"
     )
@@ -261,15 +287,18 @@ def save_score(prompt_version, model, result):
         handle.write(row)
 
 
-def save_replies(prompt_version, model, result, replies):
+def save_replies(prompt_version, model, result, replies, set_name=None):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     safe_model = re.sub(r"[^A-Za-z0-9._-]", "_", model)
-    path = RESULTS_DIR / f"{stamp}_{prompt_version}_{safe_model}.json"
+    safe_set = re.sub(r"[^A-Za-z0-9._-]", "_", set_name) if set_name else ""
+    parts = [stamp, prompt_version] + ([safe_set] if safe_set else []) + [safe_model]
+    path = RESULTS_DIR / ("_".join(parts) + ".json")
     path.write_text(
         json.dumps(
             {
                 "prompt": prompt_version,
+                "email_set": set_name,
                 "model": model,
                 "accuracy": result["accuracy"],
                 "replies": replies,
@@ -284,36 +313,70 @@ def save_replies(prompt_version, model, result, replies):
 
 # ---- The run ----------------------------------------------------------------
 
-def dry_run(prompt_version, model, prompt, emails):
+def dry_run(prompt_version, model, prompt, emails, set_name=None):
     print("Dry run: nothing will be sent. Add --live to make real AI calls.")
     print(f"Prompt version: {prompt_version}")
     print(f"Model: {model}")
-    print(f"Found {len(emails)} emails.")
+    if set_name:
+        print(f"Email set: {set_name}")
+    print(f"Found {count_emails(len(emails))}.")
     if emails:
         first = emails[0]
-        print(f"\nThis is what would be sent for email {first['id']} (the first one):\n")
+        which = "the only one" if len(emails) == 1 else "the first one"
+        print(f"\nThis is what would be sent for email {first['id']} ({which}):\n")
         print("would send:")
         print(build_message(prompt, first["text"]))
     return 0
 
 
-def live_run(prompt_version, model, prompt, emails, expected):
+def show_single(entry, answer, raw):
+    """Print one email's result field by field. Nothing is saved."""
+    print(f"\nEmail {entry['id']} only (nothing is saved).")
+    if answer is None:
+        print("  Gemini's reply was broken (not valid JSON), so every field is wrong.")
+        print(f"  Gemini said: {(raw or '')[:300]!r}")
+    else:
+        scored = ["is_lead"] + (LEAD_FIELDS if entry["is_lead"] else [])
+        for field in scored:
+            key_text = json.dumps(entry[field], ensure_ascii=False)
+            if field in answer:
+                gemini_text = json.dumps(answer[field], ensure_ascii=False)
+                verdict = "match" if same(entry[field], answer[field]) else "WRONG"
+            else:
+                gemini_text, verdict = "(missing)", "WRONG"
+            print(f"  {field}: key {key_text}, Gemini {gemini_text}: {verdict}")
+    result = score_results([entry], {entry["id"]: answer})
+    print(f"Result: {result['correct']} of {result['total']} fields match the key.")
+
+
+def live_run(prompt_version, model, prompt, emails, expected, set_name=None, only=None):
     key = get_api_key()
-    print(f"Live run: {len(emails)} emails, prompt {prompt_version}, model {model}.")
+    print(f"Live run: {count_emails(len(emails))}, prompt {prompt_version}, model {model}.")
+    if set_name:
+        print(f"Email set: {set_name}")
     answers = {}
     replies = []
+    raw_by_id = {}
     for position, email in enumerate(emails):
         if position:
             time.sleep(PAUSE_SECONDS)
         raw = ask_gemini(model, key, build_message(prompt, email["text"]))
         parsed = parse_reply(raw)
         answers[email["id"]] = parsed
+        raw_by_id[email["id"]] = raw
         replies.append({"id": email["id"], "raw_reply": raw, "parsed": parsed})
-        print(f"Email {email['id']}: {'reply read' if parsed is not None else 'BROKEN reply'}")
+        if only is None:
+            print(f"Email {email['id']}: {'reply read' if parsed is not None else 'BROKEN reply'}")
+
+    if only is not None:
+        entry = next(e for e in expected if e["id"] == only)
+        show_single(entry, answers[only], raw_by_id[only])
+        return 0
 
     result = score_results(expected, answers)
-    save_score(prompt_version, model, result)
-    saved = save_replies(prompt_version, model, result, replies)
+    label = f"{prompt_version} [{set_name}]" if set_name else prompt_version
+    save_score(label, model, result)
+    saved = save_replies(prompt_version, model, result, replies, set_name)
 
     print()
     print(
@@ -333,15 +396,30 @@ def main():
     parser = argparse.ArgumentParser(description="Score Gemini's lead extraction on the test emails.")
     parser.add_argument("--live", action="store_true", help="really call Gemini (default is a dry run)")
     parser.add_argument("--prompt", default="v1", help="prompt version to use, like v1 (default v1)")
+    parser.add_argument("--emails", metavar="FILE", help="another email file (use with --answers)")
+    parser.add_argument("--answers", metavar="FILE", help="the answer key for that email file")
+    parser.add_argument("--only", type=int, metavar="ID", help="send only this one email and show how it matched")
     args = parser.parse_args()
 
     try:
+        if bool(args.emails) != bool(args.answers):
+            raise SetupProblem(
+                "Please use --emails and --answers together, "
+                "because another email file needs its own answer key."
+            )
         model = load_model()
         prompt = load_prompt(args.prompt)
-        emails, expected = load_test_data()
+        emails_path = resolve_path(args.emails) if args.emails else None
+        answers_path = resolve_path(args.answers) if args.answers else None
+        emails, expected = load_test_data(emails_path, answers_path)
+        set_name = Path(args.emails).stem if args.emails else None
+        if args.only is not None:
+            emails = [e for e in emails if e["id"] == args.only]
+            if not emails:
+                raise SetupProblem(f"I couldn't find email {args.only} in the emails file.")
         if not args.live:
-            return dry_run(args.prompt, model, prompt, emails)
-        return live_run(args.prompt, model, prompt, emails, expected)
+            return dry_run(args.prompt, model, prompt, emails, set_name)
+        return live_run(args.prompt, model, prompt, emails, expected, set_name, args.only)
     except SetupProblem as problem:
         print(problem)
         return 1
