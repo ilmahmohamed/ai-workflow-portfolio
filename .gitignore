@@ -9,4 +9,5 @@ __pycache__/
 venv/
 workflows/02-email-to-attio/results/
 workflows/02-email-to-attio/triage-state.json*
+workflows/02-email-to-attio/leads-to-attio-state.json*
 workflows/02-email-to-attio/triage-log.txt
