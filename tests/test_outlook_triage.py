@@ -53,11 +53,11 @@ OLD = "2026-10-01T09:00:00Z"
 OUR_CATEGORIES = ["Lead - Demo", "Lead - Pricing", "Lead - Other", "Needs review", "Not a lead"]
 
 
-def msg(message_id, subject, categories=(), received=RECENT, sender="sam@example.com", body="Hello there"):
+def msg(message_id, subject, categories=(), received=RECENT, sender="sam@example.com", body="Hello there", name="Sam"):
     return {
         "id": message_id,
         "subject": subject,
-        "from": {"emailAddress": {"address": sender, "name": "Sam"}},
+        "from": {"emailAddress": {"address": sender, "name": name}},
         "receivedDateTime": received,
         "categories": list(categories),
         "body": {"contentType": "text", "content": f"{body} {BODY_MARKER}"},
@@ -896,6 +896,205 @@ class TriageTests(unittest.TestCase):
                 self.assertEqual(gemini.calls, [])
 
     # ---- Default behaviour -------------------------------------------------------------------------------------------------------------------------------
+
+    # ---- Cases 31 to 39: system and security emails are never sent to Gemini ---
+
+    SYSTEM_WORDS = ["noreply", "no-reply", "do-not-reply", "donotreply", "accountprotection", "security"]
+    SYSTEM_DOMAINS = ["microsoft.com", "microsoftonline.com", "anthropic.com", "slack.com", "github.com", "google.com"]
+    SYSTEM_PHRASES = [
+        "verification code", "confirmation code", "one-time", "secure link", "sign in",
+        "sign-in", "password", "security alert", "new app connected",
+    ]
+
+    def assert_skipped_untouched(self, message):
+        """Run live on one email that must be skipped, and check nothing happened to it."""
+        self.state_path.unlink(missing_ok=True)
+        outlook = PretendOutlook([message])
+        gemini = PretendGemini()
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(gemini.calls, [], "a system email was sent to Gemini")
+        self.assertEqual(outlook.changes(), [])
+        self.assertFalse(self.state_path.exists())
+        self.assertEqual(outlook.where(message["id"]), "inbox")
+        self.assertEqual(outlook.categories(message["id"]), message["categories"])
+        self.assertIn(f"Skipped (system or security email): {message['subject']}", output)
+        self.assertIn("System or security emails skipped: 1", output)
+        return output
+
+    def assert_handled_as_a_normal_lead(self, message, marker):
+        """Run live on one email that must NOT be skipped: it goes to Gemini and becomes a lead."""
+        self.state_path.unlink(missing_ok=True)
+        outlook = PretendOutlook([message])
+        gemini = PretendGemini({marker: lead_reply("pricing")})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(gemini.calls), 1, "the email should have been sent to Gemini")
+        self.assertEqual(outlook.categories("moved-" + message["id"]), ["Lead - Pricing"])
+        self.assertEqual(outlook.where(message["id"]), "leads")
+        self.assertIn("System or security emails skipped: 0", output)
+        self.assertNotIn("Skipped (system or security email)", output)
+
+    def test_case31_system_words_before_the_at_sign_are_skipped(self):
+        for word in self.SYSTEM_WORDS:
+            for sender in (f"{word.upper()}@example.com", f"info-{word}-team@example.com"):
+                with self.subTest(sender=sender):
+                    self.assert_skipped_untouched(msg("m1", "Hello from us", sender=sender))
+
+    def test_case31_do_not_reply_at_something_dot_com_is_skipped(self):
+        self.assert_skipped_untouched(msg("m1", "Hello from us", sender="do-not-reply@something.com"))
+
+    def test_case32_system_domains_and_their_subdomains_are_skipped(self):
+        for domain in self.SYSTEM_DOMAINS:
+            for host in (domain, "account." + domain, domain.upper()):
+                with self.subTest(host=host):
+                    self.assert_skipped_untouched(msg("m1", "Hello from us", sender=f"Info@{host}"))
+
+    def test_case32_look_alike_and_ordinary_domains_are_not_skipped(self):
+        for host in ("notmicrosoft.com", "notgoogle.com", "mygithub.com", "google.com.example.net",
+                     "microsoft.com.evil.example", "gmail.com", "example.com"):
+            with self.subTest(host=host):
+                self.state_path.unlink(missing_ok=True)
+                outlook = PretendOutlook([msg("m1", "Hello from us", sender=f"info@{host}")])
+                gemini = PretendGemini({"Hello from us": NOT_LEAD})
+                code, output = self.live(outlook, gemini)
+                self.assertEqual(code, 0)
+                self.assertEqual(len(gemini.calls), 1)
+                self.assertEqual(outlook.categories("m1"), ["Not a lead"])
+                self.assertIn("System or security emails skipped: 0", output)
+
+    def test_case33_security_subjects_are_skipped_in_any_capitals(self):
+        for phrase in self.SYSTEM_PHRASES:
+            for subject in (f"Your {phrase} is ready", f"YOUR {phrase.upper()} IS READY"):
+                with self.subTest(subject=subject):
+                    self.assert_skipped_untouched(msg("m1", subject))
+
+    def test_case40_whole_phrases_are_skipped_even_with_punctuation(self):
+        for subject in ("Sign in to your account", "SIGN IN NOW", "Reset your password.",
+                        "Verification code: 123456", "(Your one-time code)", "A security alert for you",
+                        "password", "Please sign-in again"):
+            with self.subTest(subject=subject):
+                self.assert_skipped_untouched(msg("m1", subject))
+
+    def test_case40_a_phrase_inside_a_longer_word_is_not_skipped(self):
+        for subject in ("Design information", "Resign in writing"):
+            with self.subTest(subject=subject):
+                self.assert_handled_as_a_normal_lead(msg("m1", subject), subject)
+
+    def test_case41_the_display_name_is_not_checked(self):
+        message = msg("m1", "Pricing question", sender="hello@acme.example.com", name="Acme Security Ltd")
+        self.assert_handled_as_a_normal_lead(message, "Pricing question")
+        for name in ("No Reply Team", "Do Not Reply", "Account Protection"):
+            with self.subTest(name=name):
+                message = msg("m1", "Pricing question", sender="hello@acme.example.com", name=name)
+                self.assert_handled_as_a_normal_lead(message, "Pricing question")
+
+    def test_case42_sender_words_after_the_at_sign_do_not_count(self):
+        for sender in ("info@security-experts.example.com", "sam@no-reply-mail.example.com",
+                       "sam@donotreply.example.com"):
+            with self.subTest(sender=sender):
+                self.assert_handled_as_a_normal_lead(msg("m1", "Pricing question", sender=sender), "Pricing question")
+
+    def test_case34_a_skipped_email_keeps_its_own_categories_and_is_skipped_again_later(self):
+        message = msg("m1", "Your password", categories=["Blue"], sender="noreply@example.com")
+        self.assert_skipped_untouched(message)
+        self.assert_skipped_untouched(message)
+
+    def test_case35_each_skipped_email_is_reported_and_counted(self):
+        outlook = PretendOutlook([
+            msg("s1", "Your verification code", received="2026-10-20T07:00:00Z"),
+            msg("s2", "Hello", sender="noreply@example.com", received="2026-10-20T08:00:00Z"),
+            msg("n1", "Weekly newsletter", received="2026-10-20T09:00:00Z"),
+        ])
+        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn("Skipped (system or security email): Your verification code", output)
+        self.assertIn("Skipped (system or security email): Hello", output)
+        self.assertIn("System or security emails skipped: 2", output)
+        self.assertEqual(len(gemini.calls), 1)
+        self.assertEqual(outlook.categories("s1"), [])
+        self.assertEqual(outlook.categories("s2"), [])
+        self.assertEqual(sorted(self.state()["emails"]), ["n1"])
+
+    def test_case35_a_dry_run_reports_skipped_emails_and_does_not_list_them_as_to_send(self):
+        outlook = PretendOutlook([
+            msg("s1", "Your verification code", received="2026-10-20T07:00:00Z"),
+            msg("s2", "Hello", sender="noreply@example.com", received="2026-10-20T08:00:00Z"),
+            msg("n1", "Weekly newsletter", received="2026-10-20T09:00:00Z"),
+        ])
+        gemini = PretendGemini()
+        code, output = self.run_main(outlook, gemini, [])
+        self.assertEqual(code, 0)
+        self.assertIn("Skipped (system or security email): Your verification code", output)
+        self.assertIn("Skipped (system or security email): Hello", output)
+        self.assertIn("System or security emails skipped: 2", output)
+        self.assertIn("would send to Gemini: sam@example.com, Weekly newsletter", output)
+        self.assertNotIn("would send to Gemini: sam@example.com, Your verification code", output)
+        self.assertEqual(outlook.changes(), [])
+
+    def test_case36_the_body_is_not_used_for_this_rule(self):
+        outlook = PretendOutlook([msg("m1", "Quick hello", body="your verification code and password are in the security alert")])
+        gemini = PretendGemini({"Quick hello": NOT_LEAD})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(gemini.calls), 1)
+        self.assertIn("System or security emails skipped: 0", output)
+
+    def test_case37_triage_test_emails_are_exempt(self):
+        cases = [
+            ("noreply@example.com", "TRIAGE-TEST hello"),
+            ("alerts@microsoft.com", "triage-test Security alert"),
+            ("sam@example.com", "TRIAGE-TEST password reset"),
+        ]
+        for sender, subject in cases:
+            with self.subTest(sender=sender, subject=subject):
+                self.state_path.unlink(missing_ok=True)
+                outlook = PretendOutlook([msg("m1", subject, sender=sender)])
+                gemini = PretendGemini({subject: NOT_LEAD})
+                code, output = self.live(outlook, gemini)
+                self.assertEqual(code, 0)
+                self.assertEqual(len(gemini.calls), 1)
+                self.assertEqual(outlook.categories("m1"), ["Not a lead"])
+                self.assertIn("System or security emails skipped: 0", output)
+
+    def test_case38_skipped_emails_do_not_use_up_the_maximum(self):
+        skipped = [msg(f"s{i}", f"Your password {i}", received=f"2026-10-20T0{i}:00:00Z") for i in range(3)]
+        normal = [msg(f"n{i}", f"Plain thing {i}", received=f"2026-10-20T1{i}:00:00Z") for i in range(2)]
+        outlook = PretendOutlook(skipped + normal)
+        gemini = PretendGemini({f"Plain thing {i}": NOT_LEAD for i in range(2)})
+        with mock.patch.object(outlook_triage, "MAX_PER_RUN", 2):
+            code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(gemini.calls), 2)
+        self.assertNotIn("still waiting", output)
+        self.assertIn("System or security emails skipped: 3", output)
+
+    def test_case38_only_subject_still_applies_first(self):
+        outlook = PretendOutlook([
+            msg("a", "Your invoice", sender="noreply@example.com", received="2026-10-20T07:00:00Z"),
+            msg("b", "Security alert", sender="noreply@example.com", received="2026-10-20T08:00:00Z"),
+        ])
+        gemini = PretendGemini()
+        code, output = self.live(outlook, gemini, "--only-subject", "invoice")
+        self.assertEqual(code, 0)
+        self.assertIn("Skipped (system or security email): Your invoice", output)
+        self.assertNotIn("Security alert", output)
+        self.assertIn("System or security emails skipped: 1", output)
+        self.assertEqual(gemini.calls, [])
+
+    def test_case39_emails_handled_earlier_are_not_announced_again(self):
+        outlook = PretendOutlook([msg("m1", "Weekly newsletter")])
+        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
+        self.live(outlook, gemini)
+        outlook.inbox["m1"]["categories"] = []
+        outlook.inbox["m1"]["from"]["emailAddress"]["address"] = "noreply@example.com"
+        calls_before = len(gemini.calls)
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(gemini.calls), calls_before)
+        self.assertNotIn("Skipped (system or security email)", output)
+        self.assertIn("System or security emails skipped: 0", output)
 
     def test_case30_when_gemini_cannot_be_reached_the_message_says_why(self):
         scenarios = [

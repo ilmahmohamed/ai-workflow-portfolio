@@ -202,11 +202,87 @@ Some expected results depend on the "Decisions for Ilmah" at the end of this fil
 - Expected: the email being handled is left untouched and is not written in the state file. Emails handled earlier stay handled.
 - Expected: the message never contains the Gemini key, the Outlook token, any email text, or the technical error text from the failure.
 
+## Case 31: system or security senders are skipped
+
+- Input: new emails whose sender address, in the part before the @, contains noreply, no-reply, do-not-reply, donotreply, accountprotection or security, in any capitals. For example "noreply@example.com", "do-not-reply@something.com" or "Security-Team@example.com".
+- Expected: each one is skipped. It gets no category, is not moved, has no state entry, and is never sent to Gemini.
+- Expected: only the part before the @ is checked, and the sender's display name is not checked (see Cases 41 and 42).
+
+## Case 32: system domains are skipped
+
+- Input: new emails whose sender address is at microsoft.com, microsoftonline.com, anthropic.com, slack.com, github.com or google.com, exactly or as a subdomain such as account.microsoft.com or mail.google.com, in any capitals.
+- Expected: each one is skipped, as in Case 31.
+- Input: look-alike and ordinary domains such as notmicrosoft.com, notgoogle.com, mygithub.com, google.com.example.net, microsoft.com.evil.example and gmail.com.
+- Expected: they are not skipped by this rule. The domain must match exactly or as a subdomain, never as part of a longer name. They are handled as normal emails.
+
+## Case 33: security subjects are skipped
+
+- Input: new emails from an ordinary sender whose subject contains verification code, confirmation code, one-time, secure link, sign in, sign-in, password, security alert or new app connected, as whole words, anywhere in the subject and in any capitals.
+- Expected: each one is skipped, as in Case 31. See Case 40 for what "whole words" means.
+
+## Case 34: a skipped email is left completely untouched
+
+- Input: any skipped email, with or without categories of its own.
+- Expected: no category is added, it is not moved, nothing is written to the state file, no change request of any kind is sent to Outlook, and Gemini is not called.
+- Expected: it stays in the Inbox, and on later runs it is skipped again in the same way.
+
+## Case 35: each skipped email is reported and counted
+
+- Input: a run with two skipped emails and one ordinary email, once live and once as a dry run.
+- Expected: one plain line for each skipped email: "Skipped (system or security email): <subject>".
+- Expected: the final report counts them, for example "System or security emails skipped: 2". The count is also shown when every email was skipped, and in a dry run.
+- Expected: in a dry run, skipped emails are not listed as "would send to Gemini".
+
+## Case 36: only the sender and subject are checked
+
+- Input: an ordinary sender and an ordinary subject, but the body mentions "password" or "verification code".
+- Expected: the email is handled as normal, because the body is not used for this rule.
+- Expected: for a skipped email, no email text at all reaches Gemini.
+
+## Case 37: TRIAGE-TEST emails are exempt
+
+- Input: an email whose subject contains TRIAGE-TEST (in any capitals), even when its sender or subject would otherwise match, for example a noreply sender or "TRIAGE-TEST password reset".
+- Expected: the rule is not applied to it. It is handled as a normal email.
+
+## Case 38: skipped emails do not use up the maximum, and --only-subject still applies first
+
+- Input: more skipped emails than the maximum per run, plus a few ordinary emails.
+- Expected: all the ordinary emails are handled. Skipped emails never count as handled or as still waiting.
+- Input: --only-subject "invoice", with a skipped email whose subject contains "invoice" and another skipped email whose subject does not.
+- Expected: only the first is reported as skipped. The other is ignored, like any email that does not match the text.
+
+## Case 39: emails handled earlier are not announced again
+
+- Input: an email already in the state file, whose sender would now count as a system sender.
+- Expected: it is counted with the other already-handled emails, not as a system or security email, and no "Skipped (system or security email)" line is printed for it.
+
+## Case 40: subject phrases must match as whole words
+
+- Input: a subject such as "Sign in to your account", "SIGN IN NOW", "Reset your password.", "Verification code: 123456", "Your one-time code" or "A security alert for you".
+- Expected: each one is skipped. A phrase counts when it stands on its own, with punctuation, spaces or the ends of the subject on both sides.
+- Input: a real lead whose subject is "Design information", or "Resign in writing".
+- Expected: they are not skipped, because "sign in" is only part of a longer word there. They are sent to Gemini and handled as normal emails.
+
+## Case 41: the sender's display name is not checked
+
+- Input: a real lead from a sender named "Acme Security Ltd" with a normal address such as "hello@acme.example.com".
+- Expected: it is not skipped. It is sent to Gemini and handled as a normal email.
+- Input: normal addresses with display names such as "No Reply Team" or "Do Not Reply".
+- Expected: they are not skipped either, because only the address is checked.
+
+## Case 42: sender words count only before the @
+
+- Input: sender addresses where one of the words appears only after the @, such as "info@security-experts.example.com" or "sam@no-reply-mail.example.com".
+- Expected: they are not skipped by the sender-word rule. They are handled as normal emails, unless the domain is one of the listed system domains.
+- Input: the same words before the @, such as "do-not-reply@something.com" or "info-security-team@example.com".
+- Expected: they are skipped, as in Case 31.
+
 ## Default behaviour
 
 - The script runs as a dry run unless it is started with --live.
 - It uses prompt v2 and the model named in config.json.
 - It reads only the Inbox, never the Leads folder.
+- System and security emails (by sender or subject) are never sent to Gemini and are left completely untouched.
 - The only changes it makes in Outlook are adding one category and moving a lead to the Leads folder. It never sends, replies, forwards, copies or deletes.
 - It never prints, logs or opens a token or key. The state file never holds any email text or secret.
 - The state file is git-ignored.

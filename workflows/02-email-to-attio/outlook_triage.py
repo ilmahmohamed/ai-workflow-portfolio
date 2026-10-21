@@ -23,6 +23,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -61,6 +62,23 @@ REQUEST_TO_CATEGORY = {
     "other": LEAD_OTHER,
 }
 LEAD_REQUIRED_FIELDS = ("name", "email", "company", "role", "request_type", "urgency")
+
+# System and security emails are never sent to Gemini and are left untouched.
+# They are spotted from the sender address and the subject only, never the body
+# and never the sender's display name.
+#   - sender words: looked for only in the part of the address before the @
+#   - domains: must match exactly or as a subdomain, never as part of a longer name
+#   - subject phrases: must match as whole words, so "Design information" is fine
+SYSTEM_SENDER_WORDS = ("noreply", "no-reply", "do-not-reply", "donotreply", "accountprotection", "security")
+SYSTEM_DOMAINS = ("microsoft.com", "microsoftonline.com", "anthropic.com", "slack.com", "github.com", "google.com")
+SYSTEM_SUBJECT_PHRASES = (
+    "verification code", "confirmation code", "one-time", "secure link", "sign in",
+    "sign-in", "password", "security alert", "new app connected",
+)
+SYSTEM_SUBJECT_PATTERNS = tuple(
+    re.compile(r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z0-9])") for phrase in SYSTEM_SUBJECT_PHRASES
+)
+EXEMPT_SUBJECT = "triage-test"   # our own test emails are never treated as system emails
 
 PROBLEMS = (SignInProblem, extract_leads.SetupProblem)
 
@@ -201,6 +219,26 @@ def has_our_category(message):
     return any((c or "").strip().lower() in ours for c in (message.get("categories") or []))
 
 
+def is_system_email(message):
+    """True for system or security emails, judged by sender address and subject only.
+
+    The body and the sender's display name are never used.
+    """
+    subject = (message.get("subject") or "").lower()
+    if EXEMPT_SUBJECT in subject:
+        return False
+    sender = ((message.get("from") or {}).get("emailAddress")) or {}
+    address = (sender.get("address") or "").lower()
+    local_part, at_sign, domain = address.rpartition("@")
+    if not at_sign:
+        local_part, domain = "", ""   # no usable address: only the subject can decide
+    if any(word in local_part for word in SYSTEM_SENDER_WORDS):
+        return True
+    if any(domain == d or domain.endswith("." + d) for d in SYSTEM_DOMAINS):
+        return True
+    return any(pattern.search(subject) for pattern in SYSTEM_SUBJECT_PATTERNS)
+
+
 def parse_time(text):
     try:
         return datetime.datetime.fromisoformat((text or "").replace("Z", "+00:00"))
@@ -263,7 +301,7 @@ def record(state, message_id, category, stage, urgency):
 # ---- The run ----------------------------------------------------------------
 
 def choose_emails(messages, state, since, only_subject):
-    """Returns (eligible [(message, kind)], skipped_count), oldest first."""
+    """Returns (eligible [(message, kind)], skipped_count, system_emails), oldest first."""
     needle = only_subject.strip().lower() if only_subject is not None else None
     dated = []
     for message in messages:
@@ -273,7 +311,7 @@ def choose_emails(messages, state, since, only_subject):
         dated.append((received, message))
     dated.sort(key=lambda pair: (pair[0], pair[1].get("id", "")))
 
-    eligible, skipped, seen = [], 0, set()
+    eligible, skipped, system, seen = [], 0, [], set()
     for _, message in dated:
         message_id = message.get("id")
         if not message_id or message_id in seen:
@@ -286,9 +324,11 @@ def choose_emails(messages, state, since, only_subject):
             eligible.append((message, "retry"))
         elif entry or has_our_category(message):
             skipped += 1
+        elif is_system_email(message):
+            system.append(message)
         else:
             eligible.append((message, "new"))
-    return eligible, skipped
+    return eligible, skipped, system
 
 
 def dry_run(model, prompt_version, eligible, skipped, waiting):
@@ -306,7 +346,11 @@ def dry_run(model, prompt_version, eligible, skipped, waiting):
     return 0
 
 
-def live_run(token, key, model, prompt, state, eligible, skipped, waiting):
+def print_system_count(count):
+    print(f"System or security emails skipped: {count}")
+
+
+def live_run(token, key, model, prompt, state, eligible, skipped, waiting, system_count):
     leads_id = find_leads_folder(token)   # stops here, before any change, if there is no Leads folder
     counts = {}
     broken = 0
@@ -351,6 +395,7 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting):
         if counts.get(category):
             print(f"  {category}: {counts[category]}")
     print(f"Skipped (already handled or already tagged): {skipped}")
+    print_system_count(system_count)
     print(f"Broken replies: {broken}")
     if waiting:
         print(f"{waiting} still waiting for the next run.")
@@ -374,20 +419,27 @@ def run(live, only_subject, prompt_version):
         print(note)
 
     since = now() - datetime.timedelta(days=LOOKBACK_DAYS)
-    eligible, skipped = choose_emails(list_inbox(token, since), state, since, only_subject)
+    eligible, skipped, system = choose_emails(list_inbox(token, since), state, since, only_subject)
     waiting = max(0, len(eligible) - MAX_PER_RUN)
     eligible = eligible[:MAX_PER_RUN]
 
+    # System and security emails are reported and left completely untouched.
+    for message in system:
+        print(f"Skipped (system or security email): {subject_of(message)}")
+
     if not eligible:
-        if only_subject is not None:
+        if only_subject is not None and not system:
             print(f'No new email with "{only_subject.strip()}" in the subject was found. Nothing was changed.')
         else:
             print(f"No new emails to handle. Skipped {skipped} that were already handled or tagged.")
+        print_system_count(len(system))
         return 0
 
     if not live:
-        return dry_run(model, prompt_version, eligible, skipped, waiting)
-    return live_run(token, key, model, prompt, state, eligible, skipped, waiting)
+        code = dry_run(model, prompt_version, eligible, skipped, waiting)
+        print_system_count(len(system))
+        return code
+    return live_run(token, key, model, prompt, state, eligible, skipped, waiting, len(system))
 
 
 def main():
