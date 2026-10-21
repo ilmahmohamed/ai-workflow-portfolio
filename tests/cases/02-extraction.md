@@ -154,6 +154,19 @@ No real keys appear in this file.
 - Input: a normal run with none of --emails, --answers or --only.
 - Expected: it works exactly as before. All emails in the 30-email file are used, no "Email set" line is shown, and the accuracy row has no brackets.
 
+## Case 21: the "couldn't reach the AI service" message says why
+
+- Input: the request to Gemini times out.
+- Expected: the plain message still starts with "I couldn't reach the AI service" and adds the reason "(the request timed out)".
+- Input: there is no connection at all.
+- Expected: the message adds "(no connection)".
+- Input: some other connection problem.
+- Expected: the message adds "(a connection problem)".
+- Input: Gemini answers with a server error such as 500, 502 or 503.
+- Expected: the message adds the real number, for example "(Gemini answered with code 503)".
+- Expected: the hint never contains the key, a token, any email text, or the technical error text from the failure.
+- Expected: as before, the script stops and no half-finished score is saved.
+
 ## Default behaviour
 
 - The script runs as a dry run unless it is started with --live.

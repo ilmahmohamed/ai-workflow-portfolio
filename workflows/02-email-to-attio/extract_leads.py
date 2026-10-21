@@ -158,6 +158,17 @@ def count_emails(number):
 
 # ---- Talking to Gemini ------------------------------------------------------
 
+def unreachable(reason):
+    """The plain message for "couldn't reach Gemini", with a safe hint about why.
+
+    The reason is always one of our own short phrases or a status number, never
+    the error text from the failure, so it can't contain a key or email text.
+    """
+    return SetupProblem(
+        f"I couldn't reach the AI service ({reason}). Check your internet and try again."
+    )
+
+
 def call_once(model, key, message):
     """One request. Returns the model's text, or raises SetupProblem / RateLimited."""
     try:
@@ -170,8 +181,12 @@ def call_once(model, key, message):
             },
             timeout=REQUEST_TIMEOUT,
         )
+    except requests.exceptions.Timeout:
+        raise unreachable("the request timed out")
+    except requests.exceptions.ConnectionError:
+        raise unreachable("no connection")
     except requests.exceptions.RequestException:
-        raise SetupProblem("I couldn't reach the AI service. Check your internet and try again.")
+        raise unreachable("a connection problem")
 
     code = response.status_code
     if code == 200:
@@ -189,7 +204,7 @@ def call_once(model, key, message):
             f"Gemini doesn't know the model name {model}. Check the name in config.json."
         )
     if code >= 500:
-        raise SetupProblem("I couldn't reach the AI service. Check your internet and try again.")
+        raise unreachable(f"Gemini answered with code {code}")
     raise SetupProblem(f"Gemini refused the request (code {code}). Nothing was saved.")
 
 

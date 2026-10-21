@@ -8,3 +8,4 @@ __pycache__/
 .venv/
 venv/
 workflows/02-email-to-attio/results/
+workflows/02-email-to-attio/triage-state.json*

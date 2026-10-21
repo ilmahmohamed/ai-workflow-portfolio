@@ -986,6 +986,48 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertNotIn("[", rows[0])
 
+    # ---- Case 21: the "couldn't reach" message says why --------------------
+
+    def unreachable_output(self, reply):
+        world = PretendGemini({JONAS_MARKER: reply})
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 1)
+        self.assertIn("I couldn't reach the AI service", output)
+        self.assertIn("Check your internet and try again.", output)
+        self.assertNotIn("Traceback", output)
+        self.assertFalse(self.accuracy_path.exists())
+        return output
+
+    def test_case21_a_timeout_says_the_request_timed_out(self):
+        output = self.unreachable_output(Raise(requests.exceptions.Timeout("slow")))
+        self.assertIn(
+            "I couldn't reach the AI service (the request timed out). Check your internet and try again.",
+            output,
+        )
+
+    def test_case21_no_connection_says_so(self):
+        output = self.unreachable_output(Raise(requests.exceptions.ConnectionError("down")))
+        self.assertIn("(no connection)", output)
+
+    def test_case21_another_connection_problem_is_named_generally(self):
+        output = self.unreachable_output(Raise(requests.exceptions.RequestException("odd")))
+        self.assertIn("(a connection problem)", output)
+
+    def test_case21_server_errors_show_the_code(self):
+        for code_number in (500, 502, 503):
+            with self.subTest(code=code_number):
+                output = self.unreachable_output(Status(code_number, "overloaded"))
+                self.assertIn(f"(Gemini answered with code {code_number})", output)
+
+    def test_case21_the_hint_never_includes_secrets_email_text_or_error_text(self):
+        leaky = Raise(requests.exceptions.ConnectionError(f"failed for {FAKE_KEY} Jonas Meyer Blue Reed Yoga"))
+        output = self.unreachable_output(leaky)
+        self.assertNotIn("failed for", output)
+        self.assertNotIn("Blue Reed Yoga", output)
+        output = self.unreachable_output(Status(503, f"overloaded {FAKE_KEY} Blue Reed Yoga"))
+        self.assertNotIn("overloaded", output)
+        self.assertNotIn("Blue Reed Yoga", output)
+
     # ---- Other safety checks ----------------------------------------------
 
     def test_a_pause_is_taken_between_calls(self):
