@@ -167,6 +167,15 @@ No real keys appear in this file.
 - Expected: the hint never contains the key, a token, any email text, or the technical error text from the failure.
 - Expected: as before, the script stops and no half-finished score is saved.
 
+## Case 22: Gemini requests are as steady as the API allows
+
+- Input: any request to Gemini (by this script, the triage or the Attio script, which share the same code).
+- Expected: the request asks for temperature 0 and a fixed seed, and for a JSON answer.
+- Input: Gemini refuses the request because it does not know the seed setting (an error 400 that mentions the seed).
+- Expected: the script retries once without the seed, carries on normally, and does not send the seed again during that run. No plain error message is shown for this.
+- Input: Gemini refuses a request with any other error 400, or with 401, 403, 404, 429 or a server error.
+- Expected: the usual plain messages appear, unchanged.
+
 ## Default behaviour
 
 - The script runs as a dry run unless it is started with --live.

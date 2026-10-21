@@ -53,8 +53,9 @@ OLD = "2026-10-01T09:00:00Z"
 OUR_CATEGORIES = ["Lead - Demo", "Lead - Pricing", "Lead - Other", "Needs review", "Not a lead"]
 
 
-def msg(message_id, subject, categories=(), received=RECENT, sender="sam@example.com", body="Hello there", name="Sam"):
-    return {
+def msg(message_id, subject, categories=(), received=RECENT, sender="sam@example.com", body="Hello there",
+        name="Sam", internet_id=None):
+    message = {
         "id": message_id,
         "subject": subject,
         "from": {"emailAddress": {"address": sender, "name": name}},
@@ -62,6 +63,9 @@ def msg(message_id, subject, categories=(), received=RECENT, sender="sam@example
         "categories": list(categories),
         "body": {"contentType": "text", "content": f"{body} {BODY_MARKER}"},
     }
+    if internet_id:
+        message["internetMessageId"] = internet_id
+    return message
 
 
 def lead_reply(request_type, urgency=1):
@@ -1116,6 +1120,41 @@ class TriageTests(unittest.TestCase):
                 self.assertNotIn(BODY_MARKER, output)
                 self.assertEqual(outlook.changes(), [])
                 self.assertFalse(self.state_path.exists())
+
+    # ---- Case 43: the triage records each email's own message ID ----------------
+
+    def test_case43_the_state_record_includes_the_message_id(self):
+        outlook = PretendOutlook([msg("m1", "Demo please", internet_id="<abc123@mail.test.example>")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.state()["emails"]["m1"]["internet_message_id"], "<abc123@mail.test.example>")
+        self.assertNotIn(BODY_MARKER, self.state_path.read_text(encoding="utf-8"))
+
+    def test_case43_the_message_id_is_asked_for_when_reading_the_inbox(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        self.run_main(outlook, PretendGemini(), [])
+        listing = [r for r in outlook.requests if r.full_url.split("?")[0].endswith("/inbox/messages")]
+        self.assertTrue(listing)
+        self.assertTrue(all("internetMessageId" in r.full_url for r in listing))
+
+    def test_case43_an_email_without_a_message_id_still_works(self):
+        outlook = PretendOutlook([msg("m1", "Weekly newsletter")])
+        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertNotIn("internet_message_id", self.state()["emails"]["m1"])
+
+    def test_case43_an_older_state_file_without_message_ids_still_loads(self):
+        self.state_path.write_text(json.dumps({"version": 1, "emails": {
+            "old": {"outcome": "Not a lead", "stage": "done", "urgency": None, "date": "2026-10-01"}}}),
+            encoding="utf-8")
+        outlook = PretendOutlook([msg("m1", "Weekly newsletter", internet_id="<n@mail.test.example>")])
+        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn("old", self.state()["emails"])
+        self.assertEqual(self.state()["emails"]["m1"]["internet_message_id"], "<n@mail.test.example>")
 
     def test_prompt_v2_and_the_config_model_are_used(self):
         outlook = PretendOutlook([msg("m1", "Demo please")])

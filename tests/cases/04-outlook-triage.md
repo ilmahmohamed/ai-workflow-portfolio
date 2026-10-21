@@ -277,6 +277,14 @@ Some expected results depend on the "Decisions for Ilmah" at the end of this fil
 - Input: the same words before the @, such as "do-not-reply@something.com" or "info-security-team@example.com".
 - Expected: they are skipped, as in Case 31.
 
+## Case 43: the triage records each email's own message ID
+
+- Input: a live run that handles an email, which carries a Message-ID header (internetMessageId).
+- Expected: the record in the state file includes that message ID, so the Attio step can recognise the email after the triage moves it to Leads (the Outlook ID changes when an email is moved, the Message-ID header does not).
+- Expected: the message ID is only an identifier. No email text is saved.
+- Input: an email with no message ID, or a state file from before this change.
+- Expected: nothing breaks. The record simply has no message ID, and older records keep working as before.
+
 ## Default behaviour
 
 - The script runs as a dry run unless it is started with --live.

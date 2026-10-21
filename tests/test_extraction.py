@@ -192,7 +192,8 @@ class PretendGemini:
     def post(self, url, headers=None, json=None, timeout=None, **kwargs):
         headers = headers or {}
         prompt_text = json["contents"][0]["parts"][0]["text"]
-        self.calls.append({"url": url, "headers": headers, "text": prompt_text})
+        self.calls.append({"url": url, "headers": headers, "text": prompt_text,
+                           "config": (json or {}).get("generationConfig")})
 
         if headers.get("x-goog-api-key") not in (FAKE_KEY, FAKE_FILE_KEY):
             return FakeHTTP(400, {"error": {
@@ -1027,6 +1028,41 @@ class ExtractionTests(unittest.TestCase):
         output = self.unreachable_output(Status(503, f"overloaded {FAKE_KEY} Blue Reed Yoga"))
         self.assertNotIn("overloaded", output)
         self.assertNotIn("Blue Reed Yoga", output)
+
+    # ---- Case 22: Gemini requests are as steady as the API allows ------------
+
+    def test_case22_requests_ask_for_temperature_0_a_fixed_seed_and_json(self):
+        world = PretendGemini(good_replies())
+        self.run_main(world, ["--live"])
+        self.assertEqual(len(world.calls), 3)
+        for call in world.calls:
+            self.assertEqual(call["config"]["temperature"], 0)
+            self.assertEqual(call["config"]["seed"], extract_leads.GENERATION_SEED)
+            self.assertEqual(call["config"]["responseMimeType"], "application/json")
+
+    def test_case22_a_refused_seed_is_retried_once_without_it(self):
+        refused = Status(400, 'Invalid JSON payload received. Unknown name "seed" at '
+                              "'generation_config': Cannot find field.")
+        replies = good_replies()
+        replies[JONAS_MARKER] = [refused, json.dumps(JONAS)]
+        world = PretendGemini(replies)
+        with mock.patch.object(extract_leads, "_seed_rejected", False):
+            code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        self.assertIn("15 of 15", output)
+        self.assertNotIn("refused", output.lower())
+        self.assertEqual(len(world.calls), 4, "one refused request, its retry, and the two other emails")
+        self.assertIn("seed", world.calls[0]["config"])
+        for call in world.calls[1:]:
+            self.assertNotIn("seed", call["config"], "the seed must not be sent again once refused")
+
+    def test_case22_other_400_errors_keep_their_usual_message(self):
+        world = PretendGemini({JONAS_MARKER: Status(400, "something else is wrong")})
+        with mock.patch.object(extract_leads, "_seed_rejected", False):
+            code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 1)
+        self.assertIn("Gemini refused the request (code 400)", output)
+        self.assertEqual(len(world.calls), 1, "no retry for an error that is not about the seed")
 
     # ---- Other safety checks ----------------------------------------------
 

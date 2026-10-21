@@ -134,7 +134,7 @@ def list_inbox(token, since):
     params = {
         "$filter": "receivedDateTime ge " + since.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "$orderby": "receivedDateTime asc",
-        "$select": "id,subject,from,receivedDateTime,categories,body",
+        "$select": "id,subject,from,receivedDateTime,categories,body,internetMessageId",
         "$top": str(PAGE_SIZE),
     }
     target = "/me/mailFolders/inbox/messages"
@@ -288,13 +288,17 @@ def save_state(state):
     os.replace(temp, STATE_PATH)
 
 
-def record(state, message_id, category, stage, urgency):
+def record(state, message_id, category, stage, urgency, internet_message_id=None):
     state["emails"][message_id] = {
         "outcome": category,
         "stage": stage,
         "urgency": urgency,
         "date": now().date().isoformat(),
     }
+    if internet_message_id:
+        # The email's own Message-ID header. Unlike the Outlook ID, it does not change when the
+        # email is moved, so later steps (the Attio script) can recognise the email in Leads.
+        state["emails"][message_id]["internet_message_id"] = internet_message_id
     save_state(state)
 
 
@@ -376,7 +380,8 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
                 broken += 1 if was_broken else 0
                 is_lead = category.startswith("Lead - ")
                 add_category(token, message, category)
-                record(state, message["id"], category, "categorised" if is_lead else "done", urgency)
+                record(state, message["id"], category, "categorised" if is_lead else "done", urgency,
+                       message.get("internetMessageId"))
                 if is_lead:
                     move_to_leads(token, message, leads_id, label)
                     state["emails"][message["id"]]["stage"] = "done"

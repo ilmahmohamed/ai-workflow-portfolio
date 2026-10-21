@@ -387,6 +387,48 @@ Some expected results depend on the "Assumptions for Ilmah" at the end of this f
 - Input: --only-from with an email that is already done, or that is skipped as a system email.
 - Expected: it is reported as already handled, or as a system or security email, exactly as without the option. The option only narrows the run, never widens it.
 
+## Case 57: an email the triage already confirmed as a lead is trusted
+
+- Input: an email in Leads whose own message ID (its Message-ID header) matches a triage record marked "Lead - Demo", "Lead - Pricing" or "Lead - Other". Gemini's reply says is_lead false, but gives a name, email address and the other details.
+- Expected: Gemini's is_lead answer does not stop the email. Gemini is used only to read the name, email, company, role, request type, urgency and summary.
+- Expected: the message sent to Gemini says the email was already confirmed as a lead and to fill in the details, and the output says "confirmed as a lead by the triage".
+- Expected: the email is handled like any other lead: person, company, deal, note, and moved to Leads/Processed. It is not marked "needs a person".
+
+## Case 58: emails the triage did not confirm keep the normal check
+
+- Input: an email in Leads with no triage record, or whose triage record is "Not a lead" or "Needs review", or whose record has no message ID (an older record).
+- Expected: Gemini's is_lead answer decides, exactly as before.
+- Expected: the message sent to Gemini does not carry the "already confirmed" note.
+
+## Case 59: matching uses the email's own message ID, not the Outlook folder ID
+
+- Input: the triage recorded the email under the Outlook ID it had in the Inbox. After the triage moved it, the email in Leads has a different Outlook ID but the same Message-ID header.
+- Expected: it is still matched, because the Message-ID header does not change when an email is moved.
+- Expected: an email whose Outlook ID equals an old triage record but whose Message-ID header is different is not matched.
+
+## Case 60: the triage record is only read, and trouble with it is harmless
+
+- Input: the triage state file is missing, empty or damaged.
+- Expected: no email is trusted, nothing crashes, and every email gets the normal is_lead check.
+- Expected: the triage state file is never changed or created by this script, in a live run or a dry run.
+
+## Case 61: a trusted email whose details cannot be read
+
+- Input: a trusted email where Gemini's reply is broken, or has no usable email address (for example only {"is_lead": false}).
+- Expected: nothing is created. The email stays in Leads, marked "needs a person", with the reason ("Gemini's reply could not be used" or "no usable email address").
+- Input: a trusted email where Gemini gives no valid request type.
+- Expected: the request type comes from the triage record (demo, pricing or other). If Gemini gives a valid request type, Gemini's wins.
+
+## Case 62: --retry-attention asks about "needs a person" emails again
+
+- Input: an email marked "needs a person" in the state file. A normal run.
+- Expected: it is reported as "Still needs a person" and Gemini is not asked again.
+- Input: the same email with --retry-attention, and Gemini now gives a usable lead.
+- Expected: Gemini is asked again, the email is handled like any other lead, and its "needs a person" mark is replaced by the normal progress record.
+- Input: the same, but Gemini again cannot be used.
+- Expected: the email stays in Leads and stays marked "needs a person", with the new reason.
+- Expected: --retry-attention never touches emails that are already done, and it works together with --only-subject and --only-from, and in a dry run (which changes no state).
+
 ## Default behaviour
 
 - The script runs as a dry run unless it is started with --live.

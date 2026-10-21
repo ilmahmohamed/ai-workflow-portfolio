@@ -46,6 +46,8 @@ KEY_NAME = "GEMINI_API_KEY"
 REQUEST_TIMEOUT = 60
 PAUSE_SECONDS = 6          # between emails, to stay inside the free per-minute limit
 RETRY_WAIT_SECONDS = 30    # wait before the one retry after "too many requests"
+GENERATION_SEED = 42       # a fixed seed, to keep answers as repeatable as the API allows
+_seed_rejected = False     # set for the rest of the run if Gemini does not accept the seed setting
 
 # Scored for every email, then for real leads only. Summary is never scored.
 LEAD_FIELDS = ["name", "email", "company", "role", "request_type", "urgency"]
@@ -169,15 +171,23 @@ def unreachable(reason):
     )
 
 
-def call_once(model, key, message):
-    """One request. Returns the model's text, or raises SetupProblem / RateLimited."""
+def generation_config():
+    """The settings that keep Gemini's answers as steady as the API allows."""
+    config = {"temperature": 0, "responseMimeType": "application/json"}
+    if not _seed_rejected:
+        config["seed"] = GENERATION_SEED
+    return config
+
+
+def send_request(model, key, message):
+    """Send one request to Gemini. Raises a plain-words SetupProblem if it can't be reached."""
     try:
-        response = requests.post(
+        return requests.post(
             API_URL.format(model=model),
             headers={"x-goog-api-key": key, "Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": message}]}],
-                "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+                "generationConfig": generation_config(),
             },
             timeout=REQUEST_TIMEOUT,
         )
@@ -187,6 +197,16 @@ def call_once(model, key, message):
         raise unreachable("no connection")
     except requests.exceptions.RequestException:
         raise unreachable("a connection problem")
+
+
+def call_once(model, key, message):
+    """One request. Returns the model's text, or raises SetupProblem / RateLimited."""
+    global _seed_rejected
+    response = send_request(model, key, message)
+    if response.status_code == 400 and not _seed_rejected and "seed" in response.text.lower():
+        # This model does not know the seed setting: carry on without it, for the rest of the run.
+        _seed_rejected = True
+        response = send_request(model, key, message)
 
     code = response.status_code
     if code == 200:

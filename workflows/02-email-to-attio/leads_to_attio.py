@@ -51,6 +51,7 @@ from outlook_signin import SetupProblem as OutlookProblem  # noqa: E402
 from outlook_signin import get_client_id, read_env_text  # noqa: E402
 from outlook_to_slack import find_leads_folder, get_access_token  # noqa: E402
 # The system and security email rule is shared with the triage, not copied.
+import outlook_triage  # noqa: E402  (its state file tells us which emails the triage confirmed as leads)
 from outlook_triage import OutlookRefused, graph, is_system_email, parse_time, read_graph, sender_of, subject_of  # noqa: E402
 
 STATE_PATH = HERE / "leads-to-attio-state.json"
@@ -66,6 +67,14 @@ MAX_NAME_CHARS = 150
 DEFAULT_PROMPT = "v2"
 STAGE_NAME = "New"
 REQUEST_TYPES = ("demo", "pricing", "partnership", "other")
+# What the triage's three lead categories mean here (used when Gemini gives no valid request type).
+TRUSTED_TYPES = {"Lead - Demo": "demo", "Lead - Pricing": "pricing", "Lead - Other": "other"}
+# Added to the prompt for an email the triage already confirmed as a lead.
+TRUSTED_NOTE = (
+    "\n\nNote: this email has already been confirmed as a genuine lead. "
+    "Do not decide whether it is a lead. Always reply with is_lead true and fill in "
+    "every field you can read from the email."
+)
 
 FREE_MAIL_DOMAINS = frozenset({
     "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "yahoo.com",
@@ -318,7 +327,7 @@ def list_leads(token, leads_id):
     """The emails directly in the Leads folder, oldest first."""
     params = {
         "$orderby": "receivedDateTime asc",
-        "$select": "id,subject,from,receivedDateTime,body",
+        "$select": "id,subject,from,receivedDateTime,body,internetMessageId",
         "$top": str(PAGE_SIZE),
     }
     target = f"/me/mailFolders/{urllib.parse.quote(leads_id, safe='')}/messages"
@@ -393,28 +402,54 @@ def save_state(state):
 
 # ---- Reading Gemini's answer -------------------------------------------------------------
 
-def read_lead(parsed):
-    """Turn Gemini's answer into (lead, reason). lead is None when a person must look."""
+def load_triage_leads():
+    """The emails the triage confirmed as leads: {message ID: request type}. Read only, never raises.
+
+    Keyed by the email's own Message-ID header, because the Outlook ID changes when the triage
+    moves the email into Leads. A missing or damaged triage file simply trusts nothing.
+    """
+    try:
+        data = json.loads(outlook_triage.STATE_PATH.read_text(encoding="utf-8"))
+        confirmed = {}
+        for record in data["emails"].values():
+            request_type = TRUSTED_TYPES.get(record.get("outcome"))
+            message_id = record.get("internet_message_id")
+            if request_type and message_id:
+                confirmed[message_id] = request_type
+        return confirmed
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
+def read_lead(parsed, trusted_type=None):
+    """Turn Gemini's answer into (lead, reason). lead is None when a person must look.
+
+    When the triage already confirmed the email as a lead, trusted_type is its request type:
+    Gemini's is_lead answer is then ignored and Gemini is only used to read the details.
+    """
     if parsed is None:
         return None, "Gemini's reply could not be used"
-    flag = parsed.get("is_lead")
-    if flag is False:
-        return None, "Gemini says it is not a lead"
-    if flag is not True:
-        return None, "Gemini's reply could not be used"
+    if trusted_type is None:
+        flag = parsed.get("is_lead")
+        if flag is False:
+            return None, "Gemini says it is not a lead"
+        if flag is not True:
+            return None, "Gemini's reply could not be used"
     email = clean_text(parsed.get("email"))
     email = email.lower() if email else None
     if not email or not EMAIL_SHAPE.match(email):
         return None, "no usable email address"
     request_type = clean_text(parsed.get("request_type"))
-    request_type = request_type.lower() if request_type else "other"
+    request_type = request_type.lower() if request_type else None
+    if request_type not in REQUEST_TYPES:
+        request_type = trusted_type or "other"
     urgency = parsed.get("urgency")
     return {
         "name": clean_text(parsed.get("name")),
         "email": email,
         "company": clean_text(parsed.get("company")),
         "role": clean_text(parsed.get("role")),
-        "request_type": request_type if request_type in REQUEST_TYPES else "other",
+        "request_type": request_type,
         "urgency": urgency if isinstance(urgency, int) and not isinstance(urgency, bool) else None,
         "summary": clean_text(parsed.get("summary")) or "(no summary)",
     }, None
@@ -643,14 +678,16 @@ def check_settings():
     return attio_key, owner, get_api_key()
 
 
-def ask_for_lead(model, gemini_key, prompt, message, asked):
+def ask_for_lead(model, gemini_key, prompt, message, asked, trusted_type=None):
     if asked:
         time.sleep(extract_leads.PAUSE_SECONDS)
+    if trusted_type:
+        prompt = prompt.rstrip() + TRUSTED_NOTE
     raw = ask_gemini(model, gemini_key, build_message(prompt, email_text(message)))
-    return read_lead(parse_reply(raw))
+    return read_lead(parse_reply(raw), trusted_type)
 
 
-def run(live, only_subject, prompt_version, only_from=None):
+def run(live, only_subject, prompt_version, only_from=None, retry_attention=False):
     if only_subject is not None and not only_subject.strip():
         raise AttioProblem(
             "The --only-subject text must not be empty, because empty text would match every email."
@@ -688,6 +725,7 @@ def run(live, only_subject, prompt_version, only_from=None):
 
     needle = only_subject.strip().lower() if only_subject is not None else None
     wanted_from = only_from.strip().lower() if only_from is not None else None
+    confirmed_by_triage = load_triage_leads()
     messages = list_leads(token, leads_id)
     messages.sort(key=lambda m: (parse_time(m.get("receivedDateTime")) or datetime.datetime.min.replace(
         tzinfo=datetime.timezone.utc), m.get("id", "")))
@@ -707,7 +745,7 @@ def run(live, only_subject, prompt_version, only_from=None):
         if entry.get("status") == "done":
             say(f"Already handled earlier, left alone: {subject_of(message)}")
             left += 1
-        elif entry.get("status") == "attention":
+        elif entry.get("status") == "attention" and not retry_attention:
             say(f"Still needs a person: {subject_of(message)} ({entry.get('reason', 'see earlier note')})")
             left += 1
         elif is_system_email(message):
@@ -744,8 +782,13 @@ def run(live, only_subject, prompt_version, only_from=None):
             message_id = message["id"]
             entry = state["emails"].get(message_id) or {}
             lead = entry.get("lead")
+            trusted_type = confirmed_by_triage.get(message.get("internetMessageId") or "")
+            if trusted_type:
+                say("  already confirmed as a lead by the triage: using Gemini only to read the details")
             if not lead:
-                lead, reason = ask_for_lead(model, gemini_key, prompt, message, asked)
+                if entry.get("status") == "attention":
+                    say("  asking Gemini again (it was marked as needing a person)")
+                lead, reason = ask_for_lead(model, gemini_key, prompt, message, asked, trusted_type)
                 asked += 1
                 if lead is None:
                     say(f"  Needs a person to look at it: {subject_of(message)} ({reason})")
@@ -798,9 +841,11 @@ def main():
     parser.add_argument("--only-subject", metavar="TEXT", help="only handle emails whose subject contains TEXT")
     parser.add_argument("--only-from", metavar="ADDRESS",
                         help="only handle emails from exactly this sender address (use with --only-subject to narrow further)")
+    parser.add_argument("--retry-attention", action="store_true",
+                        help="ask Gemini again about emails marked as needing a person")
     args = parser.parse_args()
     try:
-        return run(args.live, args.only_subject, args.prompt, args.only_from)
+        return run(args.live, args.only_subject, args.prompt, args.only_from, args.retry_attention)
     except PROBLEMS as problem:
         print(problem)
         return 1
