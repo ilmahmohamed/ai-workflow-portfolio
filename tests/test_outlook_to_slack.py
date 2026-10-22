@@ -14,6 +14,7 @@ import base64
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -41,6 +42,12 @@ FAKE_ENV = {
 SECRETS = (FAKE_SLACK_URL, FAKE_TOKEN, FAKE_CACHE)
 
 SAM = ("sam.fake@example.com", "Pricing for your wellness plan")
+ADDRESS_SHAPE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+\.[A-Za-z0-9.\-]+")
+
+
+def appears(text, output):
+    """True if the text shows up in the output as whole words (so "One" is not found inside "Done")."""
+    return re.search(r"(?<![A-Za-z0-9])" + re.escape(text) + r"(?![A-Za-z0-9])", output) is not None
 
 
 def email(sender, subject):
@@ -172,6 +179,12 @@ class OutlookToSlackTests(unittest.TestCase):
         output = buffer.getvalue().decode("utf-8")
         for secret in SECRETS:
             self.assertNotIn(secret, output, "a secret was printed on screen")
+        # Nothing about the emails may be printed: no sender, name or subject, and nothing shaped like an address.
+        for message in world.emails:
+            address = message["from"]["emailAddress"]
+            for private in (message["subject"], address["address"], address["name"]):
+                self.assertFalse(appears(private, output), "a sender, name or subject was printed")
+        self.assertIsNone(ADDRESS_SHAPE.search(output), "something shaped like an email address was printed")
         self.assertEqual(world.unexpected, [], "the script contacted an unexpected address")
         return code, output
 
@@ -186,9 +199,22 @@ class OutlookToSlackTests(unittest.TestCase):
         world = PretendWorld([email(*SAM)])
         code, output = self.run_main(world, [])
         self.assertEqual(code, 0)
-        self.assertIn(f"would post: {SAM[0]}, {SAM[1]}", output)
+        self.assertIn("would post: message 1 of 1", output)
         self.assertEqual(world.slack_posts(), [])
         self.assert_only_reads(world)
+
+    def test_the_printed_lines_use_only_a_number_and_a_count(self):
+        world = PretendWorld(self.three_emails())
+        code, output = self.run_main(world, [])
+        self.assertEqual(code, 0)
+        lines = [line for line in output.splitlines() if line.startswith("would post")]
+        self.assertEqual(lines, ["would post: message 1 of 3", "would post: message 2 of 3", "would post: message 3 of 3"])
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        lines = [line for line in output.splitlines() if line.startswith("posted")]
+        self.assertEqual(lines, ["posted: message 1 of 3", "posted: message 2 of 3", "posted: message 3 of 3"])
+        # the Slack message itself is the product and still says who wrote and what about
+        self.assertEqual(world.posted_texts()[0], "one@example.com, First")
 
     def test_case1_live_posts_one_message_with_sender_and_subject(self):
         world = PretendWorld([email(*SAM)])
@@ -292,9 +318,8 @@ class OutlookToSlackTests(unittest.TestCase):
         world = PretendWorld(self.three_emails())
         code, output = self.run_main(world, ["--limit", "1"])
         self.assertEqual(code, 0)
-        self.assertIn("would post: one@example.com, First", output)
-        self.assertNotIn("two@example.com", output)
-        self.assertNotIn("three@example.com", output)
+        self.assertIn("would post: message 1 of 1", output)
+        self.assertNotIn("message 2", output)
         self.assertEqual(world.slack_posts(), [])
 
     def test_limit_1_live_posts_exactly_one_message(self):
@@ -307,7 +332,7 @@ class OutlookToSlackTests(unittest.TestCase):
     def test_without_limit_it_still_asks_for_25(self):
         world = PretendWorld(self.three_emails())
         code, output = self.run_main(world, [])
-        self.assertIn("would post: three@example.com, Third", output)
+        self.assertIn("would post: message 3 of 3", output)
         messages = [r for r in world.outlook_requests() if r.full_url.split("?")[0].endswith("/messages")]
         self.assertIn("%24top=25", messages[0].full_url)
 

@@ -3,6 +3,8 @@
 Written before any code. Each case says what goes in and what should happen.
 All emails are fake. No real names, keys or customer data.
 
+> **Update (22 Oct).** What the script prints no longer names the sender or the subject: it prints "would post: message 1 of 3" and "posted: message 1 of 3". The message posted to Slack still shows the sender and the subject, as these cases say. See 16-private-output.md.
+
 ## Case 1: one lead email
 
 - Input: one email in the Leads folder. Sender: sam.fake@example.com. Subject: "Pricing for your wellness plan".

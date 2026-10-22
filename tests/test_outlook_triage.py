@@ -55,6 +55,19 @@ DRAFTS_ID = "drafts-id"
 DRAFT_SELECT = "id,isDraft,parentFolderId,toRecipients,ccRecipients,bccRecipients,conversationId,bodyPreview"
 BODY_MARKER = "PRIVATE-EMAIL-BODY-MARKER"
 
+ADDRESS_SHAPE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+\.[A-Za-z0-9.\-]+")
+
+
+def appears(text, output):
+    """True if the text shows up in the output as whole words (so "Sam" is not found inside "Same")."""
+    return re.search(r"(?<![A-Za-z0-9])" + re.escape(text) + r"(?![A-Za-z0-9])", output) is not None
+
+
+def ref(message_id, internet_id=None):
+    """The short ID the output uses for an email made by msg() with this id."""
+    return outlook_triage.short_id(msg(message_id, "x", internet_id=internet_id))
+
+
 NOW = datetime.datetime(2026, 10, 21, 12, 0, tzinfo=datetime.timezone.utc)
 RECENT = "2026-10-20T09:00:00Z"
 OLD = "2026-10-01T09:00:00Z"
@@ -551,9 +564,34 @@ class TriageTests(unittest.TestCase):
             for call in gemini.calls:
                 self.assertNotIn(secret, call["url"])
         self.assertNotIn(BODY_MARKER, saved, "email text was saved to a file")
+        self.assert_output_is_private(output, saved, outlook, gemini)
         self.assertEqual(outlook.unexpected, [], "the script sent an unexpected request to Outlook")
         self.assertEqual(self.env_path.read_bytes(), env_before, ".env must not change")
         return code, output
+
+    def assert_output_is_private(self, output, saved, outlook, gemini):
+        """No line printed (and nothing saved) may name a sender, a person, a subject or any email text.
+
+        Checked on every run of every test: the senders, names, reply-to addresses and subjects of all the pretend
+        emails, and the details in Gemini's pretend answers, must not appear, and nothing shaped like an address may."""
+        private = []
+        for message in list(outlook.inbox.values()) + list(outlook.leads.values()):
+            address = message["from"]["emailAddress"]
+            private += [message["subject"], address["address"], address["name"]]
+            private += [r["emailAddress"]["address"] for r in message.get("replyTo") or []]
+        for queue in gemini.replies.values():
+            for reply in queue:
+                try:
+                    answer = json.loads(reply)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(answer, dict):
+                    private += [v for k, v in answer.items() if k in ("name", "email", "company", "role", "summary", "draft_reply")
+                                and isinstance(v, str) and len(v) >= 3]
+        for text in private:
+            self.assertFalse(appears(text, output), "a sender, name, subject or lead detail was printed")
+            self.assertFalse(appears(text, saved), "a sender, name, subject or lead detail was saved to a file")
+        self.assertIsNone(ADDRESS_SHAPE.search(output), "something shaped like an email address was printed")
 
     def saved_text(self):
         parts = []
@@ -951,8 +989,8 @@ class TriageTests(unittest.TestCase):
         code, output = self.run_main(outlook, gemini, [])
         self.assertEqual(code, 0)
         self.assertIn("Dry run", output)
-        self.assertIn("would send to Gemini: sam@example.com, Demo please", output)
-        self.assertIn("would send to Gemini: sam@example.com, Weekly newsletter", output)
+        self.assertIn(f"would send to Gemini: {ref('m1')}", output)
+        self.assertIn(f"would send to Gemini: {ref('m2')}", output)
         self.assertEqual(set(outlook.methods()), {"GET"})
         self.assertEqual(gemini.calls, [])
         self.assertFalse(self.state_path.exists())
@@ -1055,7 +1093,7 @@ class TriageTests(unittest.TestCase):
         code, output = self.live(outlook, gemini, "--only-subject", "NO-SUCH-TEXT")
         self.assertEqual(code, 0)
         self.assertIn("No new email", output)
-        self.assertIn("NO-SUCH-TEXT", output)
+        self.assertNotIn("NO-SUCH-TEXT", output, "the filter text is not echoed back")
         self.assertEqual(outlook.changes(), [])
         self.assertEqual(gemini.calls, [])
 
@@ -1063,10 +1101,10 @@ class TriageTests(unittest.TestCase):
         outlook, gemini = self.triage_test_inbox(), self.triage_test_gemini()
         code, output = self.run_main(outlook, gemini, ["--only-subject", "TRIAGE-TEST"])
         self.assertEqual(code, 0)
-        self.assertIn("TRIAGE-TEST demo", output)
-        self.assertIn("triage-test newsletter", output)
-        self.assertNotIn("Real customer demo", output)
-        self.assertNotIn("Real newsletter", output)
+        self.assertIn(f"would send to Gemini: {ref('t1')}", output)
+        self.assertIn(f"would send to Gemini: {ref('t2')}", output)
+        self.assertNotIn(ref("x1"), output)
+        self.assertNotIn(ref("x2"), output)
         self.assertEqual(outlook.changes(), [])
         self.assertEqual(gemini.calls, [])
 
@@ -1127,7 +1165,7 @@ class TriageTests(unittest.TestCase):
             self.assertNotIn(message["id"], self.state()["emails"])
         self.assertEqual(outlook.where(message["id"]), "inbox")
         self.assertEqual(outlook.categories(message["id"]), message["categories"])
-        self.assertIn(f"Skipped (system or security email): {message['subject']}", output)
+        self.assertIn(f"Skipped (system or security email): {outlook_triage.short_id(message)}", output)
         self.assertIn("System or security emails skipped: 1", output)
         return output
 
@@ -1218,8 +1256,8 @@ class TriageTests(unittest.TestCase):
         gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
         code, output = self.live(outlook, gemini)
         self.assertEqual(code, 0)
-        self.assertIn("Skipped (system or security email): Your verification code", output)
-        self.assertIn("Skipped (system or security email): Hello", output)
+        self.assertIn(f"Skipped (system or security email): {ref('s1')}", output)
+        self.assertIn(f"Skipped (system or security email): {ref('s2')}", output)
         self.assertIn("System or security emails skipped: 2", output)
         self.assertEqual(len(gemini.calls), 1)
         self.assertEqual(outlook.categories("s1"), [])
@@ -1235,11 +1273,11 @@ class TriageTests(unittest.TestCase):
         gemini = PretendGemini()
         code, output = self.run_main(outlook, gemini, [])
         self.assertEqual(code, 0)
-        self.assertIn("Skipped (system or security email): Your verification code", output)
-        self.assertIn("Skipped (system or security email): Hello", output)
+        self.assertIn(f"Skipped (system or security email): {ref('s1')}", output)
+        self.assertIn(f"Skipped (system or security email): {ref('s2')}", output)
         self.assertIn("System or security emails skipped: 2", output)
-        self.assertIn("would send to Gemini: sam@example.com, Weekly newsletter", output)
-        self.assertNotIn("would send to Gemini: sam@example.com, Your verification code", output)
+        self.assertIn(f"would send to Gemini: {ref('n1')}", output)
+        self.assertNotIn(f"would send to Gemini: {ref('s1')}", output)
         self.assertEqual(outlook.changes(), [])
 
     def test_case36_the_body_is_not_used_for_this_rule(self):
@@ -1287,8 +1325,8 @@ class TriageTests(unittest.TestCase):
         gemini = PretendGemini()
         code, output = self.live(outlook, gemini, "--only-subject", "invoice")
         self.assertEqual(code, 0)
-        self.assertIn("Skipped (system or security email): Your invoice", output)
-        self.assertNotIn("Security alert", output)
+        self.assertIn(f"Skipped (system or security email): {ref('a')}", output)
+        self.assertNotIn(ref("b"), output)
         self.assertIn("System or security emails skipped: 1", output)
         self.assertEqual(gemini.calls, [])
 
@@ -1326,15 +1364,20 @@ class TriageTests(unittest.TestCase):
                 self.assertEqual(outlook.changes(), [])
                 self.assertFalse(self.state_path.exists())
 
-    # ---- Case 43: the triage records each email's own message ID ----------------
+    # ---- Case 43: the triage records each email's short ID (made from its own message ID) ----------------
 
-    def test_case43_the_state_record_includes_the_message_id(self):
+    def test_case43_the_state_record_holds_the_short_id_and_not_the_message_id_header(self):
         outlook = PretendOutlook([msg("m1", "Demo please", internet_id="<abc123@mail.test.example>")])
         gemini = PretendGemini({"Demo please": lead_reply("demo")})
         code, _ = self.live(outlook, gemini)
         self.assertEqual(code, 0)
-        self.assertEqual(self.state()["emails"]["m1"]["internet_message_id"], "<abc123@mail.test.example>")
-        self.assertNotIn(BODY_MARKER, self.state_path.read_text(encoding="utf-8"))
+        entry = self.state()["emails"]["m1"]
+        self.assertEqual(entry["short_id"], outlook_triage.short_id({"internetMessageId": "<abc123@mail.test.example>"}))
+        self.assertNotIn("internet_message_id", entry)
+        text = self.state_path.read_text(encoding="utf-8")
+        for header_part in ("abc123", "mail.test.example", "<", "@"):
+            self.assertNotIn(header_part, text, "the Message-ID header must not be kept in the state file")
+        self.assertNotIn(BODY_MARKER, text)
 
     def test_case43_the_message_id_is_asked_for_when_reading_the_inbox(self):
         outlook = PretendOutlook([msg("m1", "Demo please")])
@@ -1348,9 +1391,11 @@ class TriageTests(unittest.TestCase):
         gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
         code, _ = self.live(outlook, gemini)
         self.assertEqual(code, 0)
-        self.assertNotIn("internet_message_id", self.state()["emails"]["m1"])
+        entry = self.state()["emails"]["m1"]
+        self.assertNotIn("internet_message_id", entry)
+        self.assertEqual(entry["short_id"], outlook_triage.short_id({"id": "m1"}), "no header: made from Outlook's ID")
 
-    def test_case43_an_older_state_file_without_message_ids_still_loads(self):
+    def test_case43_an_older_state_file_without_short_ids_still_loads(self):
         self.state_path.write_text(json.dumps({"version": 1, "emails": {
             "old": {"outcome": "Not a lead", "stage": "done", "urgency": None, "date": "2026-10-01"}}}),
             encoding="utf-8")
@@ -1359,7 +1404,36 @@ class TriageTests(unittest.TestCase):
         code, _ = self.live(outlook, gemini)
         self.assertEqual(code, 0)
         self.assertIn("old", self.state()["emails"])
-        self.assertEqual(self.state()["emails"]["m1"]["internet_message_id"], "<n@mail.test.example>")
+        self.assertNotIn("short_id", self.state()["emails"]["old"], "an old record is not invented a short ID")
+        self.assertEqual(self.state()["emails"]["m1"]["short_id"],
+                         outlook_triage.short_id({"internetMessageId": "<n@mail.test.example>"}))
+
+    def test_case43_an_older_state_file_that_holds_the_header_loses_it_and_gets_the_same_short_id(self):
+        header = "<old@mail.secret-company.example>"
+        self.state_path.write_text(json.dumps({"version": 1, "emails": {
+            "old": {"outcome": "Lead - Demo", "stage": "done", "urgency": 1, "date": "2026-10-01",
+                    "internet_message_id": header}}}), encoding="utf-8")
+        outlook = PretendOutlook([msg("m1", "Weekly newsletter")])
+        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        entry = self.state()["emails"]["old"]
+        self.assertNotIn("internet_message_id", entry)
+        self.assertEqual(entry["short_id"], outlook_triage.short_id({"internetMessageId": header}),
+                         "the same email gets the same short ID as before")
+        self.assertEqual((entry["outcome"], entry["stage"]), ("Lead - Demo", "done"), "nothing else about it changes")
+        text = self.state_path.read_text(encoding="utf-8")
+        self.assertNotIn("secret-company", text)
+        self.assertNotIn("@", text)
+
+    def test_case43_a_dry_run_does_not_rewrite_an_older_state_file(self):
+        self.state_path.write_text(json.dumps({"version": 1, "emails": {
+            "old": {"outcome": "Lead - Demo", "stage": "done", "urgency": 1, "date": "2026-10-01",
+                    "internet_message_id": "<old@mail.test.example>"}}}), encoding="utf-8")
+        before = self.state_path.read_bytes()
+        code, _ = self.run_main(PretendOutlook([msg("m1", "Weekly newsletter")]), PretendGemini(), [])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.state_path.read_bytes(), before)
 
     # ---- Cases 44 and 45: a system email is reported once, not on every run ------------------
 
@@ -1374,11 +1448,11 @@ class TriageTests(unittest.TestCase):
         gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
         code, first = self.live(outlook, gemini)
         self.assertEqual(code, 0)
-        self.assertIn("Skipped (system or security email): Your verification code", first)
+        self.assertIn(f"Skipped (system or security email): {ref('s1')}", first)
         self.assertIn("System or security emails skipped: 1", first)
         code, second = self.live(outlook, gemini)
         self.assertEqual(code, 0)
-        self.assertNotIn("Skipped (system or security email): Your verification code", second)
+        self.assertNotIn(f"Skipped (system or security email): {ref('s1')}", second)
         self.assertIn("System or security emails skipped: 1 (1 already reported earlier)", second)
         self.assertEqual(outlook.categories("s1"), [])
         self.assertEqual(outlook.where("s1"), "inbox")
@@ -1392,8 +1466,8 @@ class TriageTests(unittest.TestCase):
         outlook.inbox["s2"] = msg("s2", "Your password was changed", received="2026-10-20T10:00:00Z")
         code, output = self.live(outlook, gemini)
         self.assertEqual(code, 0)
-        self.assertIn("Skipped (system or security email): Your password was changed", output)
-        self.assertNotIn("Your verification code", output)
+        self.assertIn(f"Skipped (system or security email): {ref('s2')}", output)
+        self.assertNotIn(ref("s1"), output)
         self.assertIn("System or security emails skipped: 2 (1 already reported earlier)", output)
 
     def test_case44_a_dry_run_hides_reported_emails_and_never_changes_the_state(self):
@@ -1404,15 +1478,15 @@ class TriageTests(unittest.TestCase):
         outlook.inbox["s2"] = msg("s2", "Your password was changed", received="2026-10-20T10:00:00Z")
         code, output = self.run_main(outlook, gemini, [])
         self.assertEqual(code, 0)
-        self.assertIn("Skipped (system or security email): Your password was changed", output)
-        self.assertNotIn("Your verification code", output)
+        self.assertIn(f"Skipped (system or security email): {ref('s2')}", output)
+        self.assertNotIn(ref("s1"), output)
         self.assertEqual(self.state_path.read_bytes(), before)
 
     def test_case44_a_dry_run_on_a_fresh_state_reports_but_creates_no_file(self):
         outlook = self.system_inbox()
         code, output = self.run_main(outlook, PretendGemini(), [])
         self.assertEqual(code, 0)
-        self.assertIn("Skipped (system or security email): Your verification code", output)
+        self.assertIn(f"Skipped (system or security email): {ref('s1')}", output)
         self.assertFalse(self.state_path.exists())
 
     def test_case45_old_memories_are_forgotten_and_recent_ones_kept(self):
@@ -2282,6 +2356,188 @@ class TriageTests(unittest.TestCase):
                 self.assertNotIn(word, path)
             self.assertNotIn(request.get_method(), ("DELETE", "PUT"))
         self.assertEqual(outlook_signin.SCOPES, ["Mail.ReadWrite"])
+
+    # ==== Nothing about an email is printed or logged (tests/cases/16-private-output.md) ==============
+
+    PRIVATE_SUBJECT = "PRIVATE-SUBJECT-MARKER asks about prices"
+    PRIVATE_SENDER = "private.person@secret-company.example"
+    PRIVATE_WORDS = ("PRIVATE-", "secret-company", "private.person")
+
+    def private_lead(self, message_id="p1", sender=None, subject=None, **outlook_options):
+        """A lead whose sender, names, company, subject and summary are all unmistakable fake markers."""
+        sender = sender or self.PRIVATE_SENDER
+        subject = subject or self.PRIVATE_SUBJECT
+        outlook = PretendOutlook([msg(message_id, subject, sender=sender, name="PRIVATE-NAME-MARKER",
+                                      internet_id=f"<{message_id}@mail.secret-company.example>")], **outlook_options)
+        reply = lead_reply("pricing", name="PRIVATE-LEAD-NAME", email=sender, company="PRIVATE-COMPANY-MARKER",
+                           role="PRIVATE-ROLE-MARKER", summary="PRIVATE-SUMMARY-MARKER")
+        return outlook, PretendGemini({subject: reply})
+
+    def assert_nothing_private(self, output):
+        """Nothing private in the output, and nothing private in any file the script wrote (the state file holds the
+        short ID, never the email's Message-ID header, which can contain the sender's mail domain)."""
+        saved = self.saved_text()
+        for word in self.PRIVATE_WORDS:
+            self.assertNotIn(word, output, "something private was printed")
+            self.assertNotIn(word, saved, "something private was saved to a file")
+
+    def test_p1_the_short_id_is_a_code_that_says_nothing_about_the_email(self):
+        message = msg("m1", self.PRIVATE_SUBJECT, sender=self.PRIVATE_SENDER, internet_id="<abc@mail.secret-company.example>")
+        short = outlook_triage.short_id(message)
+        self.assertRegex(short, r"^e-[0-9a-f]{6}$")
+        self.assertEqual(outlook_triage.short_id(copy.deepcopy(message)), short, "the same email always gets the same ID")
+        for word in self.PRIVATE_WORDS:
+            self.assertNotIn(word, short)
+
+    def test_p1_different_emails_get_different_ids(self):
+        ids = {outlook_triage.short_id(msg(f"m{i}", "same subject", sender="same@example.com")) for i in range(50)}
+        self.assertEqual(len(ids), 50)
+
+    def test_p1_the_id_stays_the_same_when_the_email_moves_because_it_comes_from_the_message_id_header(self):
+        before = msg("in-inbox-id", "Demo please", internet_id="<stable@mail.test.example>")
+        after = msg("in-leads-id", "Demo please", internet_id="<stable@mail.test.example>")
+        self.assertEqual(outlook_triage.short_id(before), outlook_triage.short_id(after))
+
+    def test_p1_without_a_message_id_header_the_outlook_id_is_used_and_nothing_breaks(self):
+        self.assertRegex(outlook_triage.short_id({"id": "abc"}), r"^e-[0-9a-f]{6}$")
+        self.assertRegex(outlook_triage.short_id({}), r"^e-[0-9a-f]{6}$")
+        self.assertNotEqual(outlook_triage.short_id({"id": "abc"}), outlook_triage.short_id({"id": "abd"}))
+
+    def test_p2_a_full_run_prints_only_ids_categories_and_counts(self):
+        outlook, gemini = self.private_lead()
+        message = copy.deepcopy(outlook.inbox["p1"])
+        code, output = self.live(outlook, gemini, "--slack", "test", *self.DRAFTS)
+        self.assertEqual(code, 0)
+        short = outlook_triage.short_id(message)
+        lines = output.splitlines()
+        self.assertIn(f"{short}: Lead - Pricing, moved to Leads", lines)
+        self.assertIn("  posted to Slack (test)", lines)
+        self.assertIn("  reply draft made in Drafts", lines)
+        self.assertIn("Done: 1 email(s) handled.", lines)
+        self.assertIn("Posted to Slack (test): 1", lines)
+        self.assertIn("Reply drafts made: 1", lines)
+        self.assert_nothing_private(output)
+        # but what the pipeline is FOR still holds the details: the Slack post, the draft and the saved answer
+        self.assertIn(self.PRIVATE_SENDER, self.slack.texts()[0])
+        self.assertEqual(outlook.saved_answer("p1")["company"], "PRIVATE-COMPANY-MARKER")
+
+    def test_p2_a_non_lead_is_printed_as_an_id_and_its_category_only(self):
+        outlook = PretendOutlook([msg("n1", self.PRIVATE_SUBJECT, sender=self.PRIVATE_SENDER, name="PRIVATE-NAME-MARKER")])
+        gemini = PretendGemini({self.PRIVATE_SUBJECT: NOT_LEAD})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn(f"{ref('n1')}: Not a lead", output.splitlines())
+        self.assert_nothing_private(output)
+
+    def test_p3_a_dry_run_prints_only_ids(self):
+        outlook, gemini = self.private_lead()
+        code, output = self.run_main(outlook, gemini, ["--slack", "test", *self.DRAFTS])
+        self.assertEqual(code, 0)
+        self.assertIn(f"would send to Gemini: {outlook_triage.short_id(outlook.inbox['p1'])}", output.splitlines())
+        self.assert_nothing_private(output)
+
+    def test_p4_a_system_email_is_reported_by_id_only(self):
+        outlook = PretendOutlook([msg("s1", self.PRIVATE_SUBJECT + " verification code", sender="noreply@secret-company.example",
+                                      name="PRIVATE-NAME-MARKER")])
+        code, output = self.live(outlook, PretendGemini())
+        self.assertEqual(code, 0)
+        self.assertIn(f"Skipped (system or security email): {ref('s1')}", output.splitlines())
+        self.assert_nothing_private(output)
+
+    def test_p5_a_filter_text_is_not_echoed_back(self):
+        outlook, gemini = self.private_lead()
+        for argv in (["--only-subject", "PRIVATE-FILTER-TEXT-NOBODY-HAS"], ["--live", "--only-subject", "PRIVATE-FILTER-TEXT-NOBODY-HAS"]):
+            with self.subTest(argv=argv):
+                code, output = self.run_main(outlook, gemini, argv)
+                self.assertEqual(code, 0)
+                self.assertNotIn("PRIVATE-FILTER-TEXT", output)
+                self.assertIn("No new email matching the --only-subject filter was found. Nothing was changed.", output)
+
+    def test_p6_a_retry_and_a_move_failure_name_the_email_by_id_only(self):
+        outlook, gemini = self.private_lead(move_errors={1: http_error(500)})
+        short = outlook_triage.short_id(outlook.inbox["p1"])
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 1)
+        self.assertIn(f"The email {short} was categorised but could not be moved to Leads", output)
+        self.assert_nothing_private(output)
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn(f"{short}: moved to Leads (retry)", output.splitlines())
+        self.assert_nothing_private(output)
+
+    def test_p7_no_failure_message_holds_a_sender_a_name_a_subject_or_an_answer(self):
+        scenarios = {
+            "slack refused": (dict(), dict(slack=PretendSlack(errors={1: http_error(500)})), ("--slack", "test")),
+            "slack unreachable": (dict(), dict(slack=PretendSlack(errors={1: urllib.error.URLError("down PRIVATE-X")})), ("--slack", "test")),
+            "draft refused": (dict(draft_errors={"create": http_error(500)}), dict(), self.DRAFTS),
+            "draft sign-in refused": (dict(draft_errors={"create": http_error(403)}), dict(), self.DRAFTS),
+            "draft came back wrong": (dict(create_to="PRIVATE-WRONG@secret-company.example"), dict(), self.DRAFTS),
+            "category refused": (dict(patch_errors={1: http_error(403)}), dict(), ()),
+            "saved answer refused": (dict(extension_errors={1: http_error(500)}), dict(), ()),
+            "outlook unreachable": (dict(unreachable=True), dict(), ()),
+        }
+        for name, (outlook_options, run_options, extra) in scenarios.items():
+            with self.subTest(case=name):
+                self.state_path.unlink(missing_ok=True)
+                outlook, gemini = self.private_lead(**outlook_options)
+                code, output = self.live(outlook, gemini, *extra, **run_options)
+                self.assertEqual(code, 1)
+                self.assert_nothing_private(output)
+
+    def test_p7_gemini_trouble_and_broken_answers_do_not_leak_either(self):
+        for name, reply in {
+            "timeout": Raise(requests.exceptions.Timeout("slow PRIVATE-X")),
+            "busy with private words in its error": Status(503, f"overloaded PRIVATE-SUBJECT-MARKER {self.PRIVATE_SENDER}"),
+            "refused with private words": Status(400, f"bad request PRIVATE-SUMMARY-MARKER {self.PRIVATE_SENDER}"),
+            "not json": "this is not json PRIVATE-SUMMARY-MARKER",
+            "json without a category": json.dumps({"is_lead": True, "name": "PRIVATE-LEAD-NAME", "email": self.PRIVATE_SENDER}),
+        }.items():
+            with self.subTest(case=name):
+                self.state_path.unlink(missing_ok=True)
+                outlook = PretendOutlook([msg("p1", self.PRIVATE_SUBJECT, sender=self.PRIVATE_SENDER, name="PRIVATE-NAME-MARKER")])
+                gemini = PretendGemini({self.PRIVATE_SUBJECT: reply})
+                code, output = self.live(outlook, gemini)
+                self.assert_nothing_private(output)
+
+    def test_p8_a_lead_that_gets_no_draft_says_why_without_naming_anyone(self):
+        outlook, gemini = self.private_lead(sender="private.person@secret-company.example")
+        gemini = PretendGemini({self.PRIVATE_SUBJECT: lead_reply("pricing", email="PRIVATE-OTHER@secret-company.example",
+                                                                  name="PRIVATE-LEAD-NAME", company="PRIVATE-COMPANY-MARKER")})
+        code, output = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 0)
+        self.assertIn("no reply draft was made", output)
+        self.assert_nothing_private(output)
+
+    def test_p9_a_failure_says_which_email_was_being_handled_by_id(self):
+        outlook, gemini = self.private_lead()
+        short = outlook_triage.short_id(outlook.inbox["p1"])
+        code, output = self.live(outlook, gemini, "--slack", "test", slack=PretendSlack(errors={1: http_error(500)}))
+        self.assertEqual(code, 1)
+        self.assertIn(f"The email being handled was {short}.", output.splitlines())
+        self.assertIn("Stopped. 0 email(s) were handled before this.", output)
+        self.assert_nothing_private(output)
+
+    def test_p9_what_the_state_file_holds_about_an_email(self):
+        # Not printed or logged, but kept: Outlook's ID, the category, the stage, the date and the short ID.
+        # Nothing that says who wrote, what about, or from which company: not even the Message-ID header.
+        outlook, gemini = self.private_lead()
+        self.live(outlook, gemini, "--slack", "test", *self.DRAFTS)
+        entry = self.state()["emails"]["p1"]
+        self.assertEqual(set(entry), {"outcome", "stage", "urgency", "date", "short_id"})
+        self.assertEqual(entry["short_id"], outlook_triage.short_id(outlook.inbox.get("p1") or outlook.leads["moved-p1"]))
+        text = self.state_path.read_text(encoding="utf-8")
+        for private in ("PRIVATE-", "private.person", "secret-company", "asks about prices", "PRIVATE-SUMMARY-MARKER",
+                        BODY_MARKER, "@", "<"):
+            self.assertNotIn(private, text)
+
+    def test_p10_the_scheduler_log_gets_nothing_but_this_output(self):
+        # The batch file only adds the run's printed lines to the log (plus a time and an exit code),
+        # so the log is as private as the output.
+        text = (PROJECT_ROOT / "workflows" / "02-email-to-attio" / "run_triage.bat").read_text(encoding="utf-8")
+        self.assertIn("outlook_triage.py --live >> \"%LOG%\" 2>&1", text)
+        for line in text.splitlines():
+            if ">>" in line:
+                self.assertTrue(line.startswith(("echo ===== %date% %time%", "echo exit code:", "%PY% workflows")), line)
 
 
 if __name__ == "__main__":

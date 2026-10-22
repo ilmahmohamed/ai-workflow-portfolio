@@ -14,7 +14,10 @@ When all of that worked, it moves the email to Leads/Processed. If anything fail
 the email stays in Leads and the next run carries on without duplicates.
 
 Dry run by default: it reads the saved answers and looks things up in Attio (read only), then
-prints exactly what it WOULD do. It writes nothing to Attio, moves no email and
+prints what it WOULD do. Nothing it prints names a sender, a person, a company, a deal or a subject:
+an email is named by a short ID (see short_id in outlook_triage.py), the same one the triage prints,
+and the steps are plain words, so the scheduler's log holds none of that. (What is written into Attio
+and its notes does hold the details, because that is the point.) It writes nothing to Attio, moves no email and
 does not touch the state file. Add --live to really do it.
 
 Settings (in .env, never printed): ATTIO_API_KEY, ATTIO_DEAL_OWNER (the deal
@@ -56,7 +59,9 @@ from outlook_signin import SetupProblem as OutlookProblem  # noqa: E402
 from outlook_signin import get_client_id, read_env_text  # noqa: E402
 from outlook_to_slack import find_leads_folder, get_access_token  # noqa: E402
 # The system and security email rule is shared with the triage, not copied.
-from outlook_triage import OutlookRefused, graph, is_system_email, parse_time, read_graph, sender_of, subject_of  # noqa: E402
+from outlook_triage import (  # noqa: E402
+    OutlookRefused, graph, is_system_email, parse_time, read_graph, sender_of, short_id, subject_of,
+)
 
 STATE_PATH = HERE / "leads-to-attio-state.json"
 ATTIO_BASE = "https://api.attio.com"
@@ -335,7 +340,7 @@ def list_leads(token, leads_id):
     """The emails directly in the Leads folder, oldest first."""
     params = {
         "$orderby": "receivedDateTime asc",
-        "$select": "id,subject,from,receivedDateTime",
+        "$select": "id,subject,from,receivedDateTime,internetMessageId",
         "$top": str(PAGE_SIZE),
     }
     target = f"/me/mailFolders/{urllib.parse.quote(leads_id, safe='')}/messages"
@@ -478,7 +483,7 @@ class Worker:
             if not entry.get("person_id"):
                 entry["person_id"] = found["id"]
                 entry["person_new"] = False
-            say(f"  person already exists: {email}" if not self.live else f"  found person: {email}")
+            say("  person already exists" if not self.live else "  found person")
             fill = {}
             if lead["name"] and not found["name"]:
                 fill["name"] = lead["name"]
@@ -498,7 +503,6 @@ class Worker:
             self.save()
             return found
 
-        label = lead["name"] or email
         try:
             person_id = self.client.create_person(email, lead["name"], lead["role"]) if self.live \
                 else self.planned_id("person")
@@ -508,12 +512,12 @@ class Worker:
                 raise AttioProblem("Attio refused to create the person. Nothing else was changed for this email.")
             person_id = again["id"]
             entry["person_id"], entry["person_new"] = person_id, False
-            say(f"  found person: {email}")
+            say("  found person")
             self.save()
             return again
         entry["person_id"], entry["person_new"] = person_id, True
         self.counts["people"] += 1
-        say(f"  {self.verb('created', 'would create')} person: {label} ({email})")
+        say(f"  {self.verb('created', 'would create')} person")
         record = {"id": person_id, "name": lead["name"], "job_title": lead["role"], "company": None, "deals": []}
         if not self.live:
             self.plan_people[email] = record
@@ -529,7 +533,7 @@ class Worker:
             return None
         found = self.plan_companies.get(domain) or self.client.find_company(domain)
         if found:
-            say(f"  company already exists: {domain}")
+            say("  company already exists")
             company = found
         else:
             name = shorten(lead["company"] or domain, MAX_NAME_CHARS, "...")
@@ -539,11 +543,11 @@ class Worker:
                 again = self.client.find_company(domain)
                 if not again:
                     raise AttioProblem("Attio refused to create the company. Nothing else was changed for this email.")
-                say(f"  company already exists: {domain}")
+                say("  company already exists")
                 company = again
             else:
                 self.counts["companies"] += 1
-                say(f"  {self.verb('created', 'would create')} company: {name} ({domain})")
+                say(f"  {self.verb('created', 'would create')} company")
                 company = {"id": company_id, "name": name}
             if not self.live:
                 self.plan_companies[domain] = company
@@ -579,7 +583,7 @@ class Worker:
             text = (
                 "the deal an earlier email would create" if planned_here else "the existing New deal"
             )
-            say(f"  {self.verb('adding', 'would add')} a note to {text}: {existing['name']}")
+            say(f"  {self.verb('adding', 'would add')} a note to {text}")
             self.save()
             return existing["id"]
         label = (company or {}).get("name") or lead["name"] or lead["email"]
@@ -592,7 +596,7 @@ class Worker:
             self.plan_person_deals.setdefault(person["id"], []).append(deal_id)
         entry["deal_id"], entry["deal_created"] = deal_id, True
         self.counts["deals"] += 1
-        say(f"  {self.verb('created', 'would create')} deal: {name} (stage {self.stage}, owner set)")
+        say(f"  {self.verb('created', 'would create')} deal (stage {self.stage}, owner set)")
         self.save()
         return deal_id
 
@@ -713,10 +717,10 @@ def run(live, only_subject, only_from=None, retry_attention=False):
             continue
         entry = state["emails"].get(message_id) or {}
         if entry.get("status") == "done":
-            say(f"Already handled earlier, left alone: {subject_of(message)}")
+            say(f"Already handled earlier, left alone: {short_id(message)}")
             left += 1
         elif entry.get("status") == "attention" and not retry_attention:
-            say(f"Still needs a person: {subject_of(message)} ({entry.get('reason', 'see earlier note')})")
+            say(f"Still needs a person: {short_id(message)} ({entry.get('reason', 'see earlier note')})")
             left += 1
         elif is_system_email(message):
             system.append(message)      # judged by sender and subject only
@@ -725,17 +729,18 @@ def run(live, only_subject, only_from=None, retry_attention=False):
 
     # System and security emails are reported and left completely untouched in Leads.
     for message in system:
-        say(f"Skipped (system or security email): {subject_of(message)}")
+        say(f"Skipped (system or security email): {short_id(message)}")
 
     if not waiting_list:
         if (needle is not None or wanted_from is not None) and not left and not system:
+            # The filter text is never echoed back: it could be a subject or a sender.
             if needle is not None and wanted_from is not None:
-                say(f'No lead with "{only_subject.strip()}" in the subject from "{only_from.strip()}" '
-                    "was found. Nothing was changed.")
+                say("No lead matching the --only-subject text and the --only-from address was found. "
+                    "Nothing was changed.")
             elif needle is not None:
-                say(f'No lead with "{only_subject.strip()}" in the subject was found. Nothing was changed.')
+                say("No lead matching the --only-subject text was found. Nothing was changed.")
             else:
-                say(f'No lead from "{only_from.strip()}" was found. Nothing was changed.')
+                say("No lead from the --only-from address was found. Nothing was changed.")
         else:
             say("No leads to handle.")
         say(f"System or security emails skipped: {len(system)}")
@@ -747,14 +752,13 @@ def run(live, only_subject, only_from=None, retry_attention=False):
     handled = 0
     try:
         for message in batch:
-            address, _ = sender_of(message)
-            say(f"Email: {address}, {subject_of(message)}")
+            say(f"Email: {short_id(message)}")
             message_id = message["id"]
             entry = state["emails"].get(message_id) or {}
             # The saved answer is read from the email every time; it is never copied into the state file.
             lead, reason = lead_of(token, message_id)
             if lead is None:
-                say(f"  Needs a person to look at it: {subject_of(message)} ({reason})")
+                say(f"  Needs a person to look at it: {short_id(message)} ({reason})")
                 if live:
                     state["emails"][message_id] = {"status": "attention", "reason": reason}
                     save_state(state)

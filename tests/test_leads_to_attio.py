@@ -57,6 +57,17 @@ FAKE_ENV = {
 }
 SECRETS = (FAKE_TOKEN, FAKE_CACHE, FAKE_GEMINI_KEY, FAKE_ATTIO_KEY, FAKE_OWNER)
 BODY_MARKER = "PRIVATE-EMAIL-BODY-MARKER"
+ADDRESS_SHAPE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+\.[A-Za-z0-9.\-]+")
+
+
+def appears(text, output):
+    """True if the text shows up in the output as whole words (so "Sam" is not found inside "Same")."""
+    return re.search(r"(?<![A-Za-z0-9])" + re.escape(text) + r"(?![A-Za-z0-9])", output) is not None
+
+
+def sid(message_id, internet_id=None):
+    """The short ID the output uses for an email made by lead_msg() with this id."""
+    return outlook_triage.short_id(lead_msg(message_id, "x", internet_id=internet_id))
 
 
 # ---- pretend emails and Gemini answers ------------------------------------------
@@ -640,11 +651,39 @@ class LeadsToAttioTests(unittest.TestCase):
                 self.assertNotIn(secret, request["path"])
                 self.assertNotIn(secret, json.dumps(request["body"]))
         self.assertNotIn(BODY_MARKER, saved, "email text was saved to a file")
+        self.assert_output_is_private(output, saved, outlook, attio)
         self.assertEqual(gemini.calls, [], "the Attio step called Gemini")
         self.assertEqual(outlook.unexpected, [], "an unexpected request went to Outlook")
         self.assertEqual(attio.unexpected, [], "an unexpected request went to Attio")
         self.assertEqual(self.env_path.read_bytes(), env_before, ".env must not change")
         return code, output
+
+    def assert_output_is_private(self, output, saved, outlook, attio):
+        """No line printed (and nothing saved) may name a sender, a person, a company, a deal, a subject or any email text.
+
+        Checked on every run of every test: the senders, names and subjects of all the pretend emails, the details
+        saved on them, and the names Attio holds, must not appear, and nothing shaped like an address may."""
+        private = []
+        for message in list(outlook.leads.values()) + list(outlook.inbox.values()) + list(outlook.processed.values()):
+            address = message["from"]["emailAddress"]
+            private += [message["subject"], address["address"], address["name"]]
+        for extension in outlook.extensions.values():
+            try:
+                answer = json.loads(extension["data"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if isinstance(answer, dict):
+                private += [v for k, v in answer.items() if k in ("name", "email", "company", "role", "summary", "draft_reply")
+                            and isinstance(v, str) and len(v) >= 3]
+        private += [p["name"] for p in attio.people.values() if p.get("name")] + [p["email"] for p in attio.people.values()]
+        private += [c["name"] for c in attio.companies.values()] + [c["domain"] for c in attio.companies.values()]
+        private += [d["name"] for d in attio.deals.values()]
+        for text in private:
+            if len(text) < 3:
+                continue
+            self.assertFalse(appears(text, output), "a sender, name, company, deal, subject or lead detail was printed")
+            self.assertFalse(appears(text, saved), "a sender, name, company, deal, subject or lead detail was saved to a file")
+        self.assertIsNone(ADDRESS_SHAPE.search(output), "something shaped like an email address was printed")
 
     def saved_text(self):
         parts = []
@@ -1049,8 +1088,8 @@ class LeadsToAttioTests(unittest.TestCase):
         self.two_companies(attio, subdomain_first=True)
         code, output = self.dry(outlook, attio, gemini)
         self.assertEqual(code, 0)
-        self.assertIn("company already exists: brightwell.example", output)
-        self.assertIn("would create deal: Brightwell Gyms: demo", output)
+        self.assertIn("  company already exists", output.splitlines())
+        self.assertIn("  would create deal (stage New, owner set)", output.splitlines())
         self.assertEqual(attio.writes(), [])
 
     def test_case63_two_part_endings_keep_both_parts_and_still_prefer_the_exact_domain(self):
@@ -1387,7 +1426,7 @@ class LeadsToAttioTests(unittest.TestCase):
                 code, output = self.live(outlook, attio, gemini)
                 self.assertEqual(code, 0)
                 self.assertIn("Needs a person", output)
-                self.assertIn("Hello", output)
+                self.assertIn(f"Needs a person to look at it: {sid('m1')} (no usable email address)", output)
                 self.assertEqual(attio.counts(), (0, 0, 0, 0))
                 self.assertEqual(attio.person_ids("colleague@brightwell.example"), [])
                 self.assertEqual(outlook.where("m1"), "leads")
@@ -1469,10 +1508,10 @@ class LeadsToAttioTests(unittest.TestCase):
     # ---- Case 34: Gemini says it is not a lead, or cannot be trusted --------------------------------------------------------------------------------------------------------------------------
 
     def test_case34_not_a_lead_or_unusable_answers_create_nothing_and_are_not_retried(self):
-        answers = {
-            "not a lead": json.dumps({"is_lead": False}),
-            "broken": "Sorry, I can only chat about yoga.",
-            "incomplete": json.dumps({"is_lead": True, "name": "Sam"}),
+        answers = {      # the subjects are plain labels that our own wording never uses
+            "Enquiry one": json.dumps({"is_lead": False}),
+            "Enquiry two": "Sorry, I can only chat about yoga.",
+            "Enquiry three": json.dumps({"is_lead": True, "name": "Sam"}),
         }
         for subject, reply in answers.items():
             with self.subTest(subject=subject):
@@ -1654,7 +1693,8 @@ class LeadsToAttioTests(unittest.TestCase):
                 outlook, attio, gemini = self.only_from_world()
                 code, output = self.live(outlook, attio, gemini, "--only-from", text)
                 self.assertEqual(code, 0)
-                self.assertIn(f'No lead from "{text}" was found. Nothing was changed.', output)
+                self.assertIn("No lead from the --only-from address was found. Nothing was changed.", output)
+                self.assertNotIn(text, output.replace("--only-from", ""), "the filter text must not be echoed back")
                 self.assertEqual(gemini.calls, [])
                 self.assertEqual(attio.writes(), [])
                 self.assertEqual([outlook.where(i) for i in ("n1", "o1", "n2")], ["leads", "leads", "leads"])
@@ -1664,7 +1704,8 @@ class LeadsToAttioTests(unittest.TestCase):
         code, output = self.live(outlook, attio, gemini, "--only-subject", "Demo request",
                                  "--only-from", "nobody@nautspace.example")
         self.assertEqual(code, 0)
-        self.assertIn('No lead with "Demo request" in the subject from "nobody@nautspace.example" was found.', output)
+        self.assertIn("No lead matching the --only-subject text and the --only-from address was found. "
+                      "Nothing was changed.", output)
         self.assertEqual(gemini.calls, [])
 
     def test_case55_an_empty_address_is_refused_before_anything_is_read(self):
@@ -1684,7 +1725,7 @@ class LeadsToAttioTests(unittest.TestCase):
                                 "--only-from", "jo@nautspace.example")
         self.assertEqual(code, 0)
         self.assertEqual(output.count("Email: "), 1)
-        self.assertIn("Email: jo@nautspace.example, Demo request", output)
+        self.assertIn(f"Email: {sid('n1')}", output.splitlines())
         self.assertIn("1 lead(s) would be handled", output)
         self.assertEqual(len(gemini.calls), 0)
         self.assertEqual(attio.writes(), [])
@@ -1699,8 +1740,8 @@ class LeadsToAttioTests(unittest.TestCase):
         calls = len(gemini.calls)
         code, output = self.live(outlook, attio, gemini, "--only-from", "jo@nautspace.example")
         self.assertEqual(code, 0)
-        self.assertIn("Already handled earlier, left alone: Demo request", output)
-        self.assertIn("Skipped (system or security email): Your verification code", output)
+        self.assertIn(f"Already handled earlier, left alone: {sid('n1')}", output.splitlines())
+        self.assertIn(f"Skipped (system or security email): {sid('s1')}", output.splitlines())
         self.assertNotIn("Needs a person", output)
         self.assertEqual(outlook.where("s1"), "leads")
         self.assertEqual(len(gemini.calls), calls)
@@ -2067,7 +2108,7 @@ class LeadsToAttioTests(unittest.TestCase):
         self.assertEqual(outlook.where(message["id"]), "leads")
         self.assertEqual(outlook.changes(), [])
         self.assertFalse(self.state_path.exists())
-        self.assertIn(f"Skipped (system or security email): {message['subject']}", output)
+        self.assertIn(f"Skipped (system or security email): {outlook_triage.short_id(message)}", output)
         self.assertIn("System or security emails skipped: 1", output)
         self.assertNotIn("Needs a person", output)
         return output
@@ -2094,7 +2135,7 @@ class LeadsToAttioTests(unittest.TestCase):
         for _ in range(2):
             code, output = self.live(outlook, attio, gemini)
             self.assertEqual(code, 0)
-            self.assertIn("Skipped (system or security email): Your verification code", output)
+            self.assertIn(f"Skipped (system or security email): {sid('m1')}", output)
         self.assertEqual(gemini.calls, [])
         self.assertFalse(self.state_path.exists())
 
@@ -2111,11 +2152,11 @@ class LeadsToAttioTests(unittest.TestCase):
                 attio = PretendAttio()
                 code, output = self.run_main(outlook, attio, gemini, argv)
                 self.assertEqual(code, 0)
-                self.assertIn("Skipped (system or security email): Your verification code", output)
-                self.assertIn("Skipped (system or security email): Hello", output)
+                self.assertIn(f"Skipped (system or security email): {sid('s1')}", output)
+                self.assertIn(f"Skipped (system or security email): {sid('s2')}", output)
                 self.assertIn("System or security emails skipped: 2", output)
                 self.assertEqual(len(gemini.calls), 0)
-                self.assertNotIn("Email: noreply@example.com", output)
+                self.assertNotIn(f"Email: {sid('s2')}", output)
                 self.assertNotIn("Needs a person", output)
                 self.assertEqual(outlook.where("s1"), "leads")
                 self.assertEqual(outlook.where("s2"), "leads")
@@ -2176,8 +2217,8 @@ class LeadsToAttioTests(unittest.TestCase):
         gemini, attio = PretendGemini(), PretendAttio()
         code, output = self.live(outlook, attio, gemini, "--only-subject", "invoice")
         self.assertEqual(code, 0)
-        self.assertIn("Skipped (system or security email): Your invoice", output)
-        self.assertNotIn("Security alert", output)
+        self.assertIn(f"Skipped (system or security email): {sid('a')}", output)
+        self.assertNotIn(sid("b"), output)
         self.assertIn("System or security emails skipped: 1", output)
         self.assertEqual(gemini.calls, [])
 
@@ -2425,6 +2466,171 @@ class LeadsToAttioTests(unittest.TestCase):
         self.assertEqual(self.state_path.read_bytes(), before)
         self.assertEqual(attio.counts(), (0, 0, 0, 0))
         self.assertEqual(outlook.where("m1"), "leads")
+
+    # ==== Nothing about a lead is printed or logged (tests/cases/16-private-output.md) =================
+
+    PRIVATE_SUBJECT = "PRIVATE-SUBJECT-MARKER wants a demo"
+    PRIVATE_SENDER = "private.person@secret-company.example"
+    PRIVATE_WORDS = ("PRIVATE-", "secret-company", "private.person")
+
+    def private_world(self, sender=None, **outlook_options):
+        """A lead whose sender, names, company, role, subject and summary are all unmistakable fake markers."""
+        sender = sender or self.PRIVATE_SENDER
+        message = lead_msg("p1", self.PRIVATE_SUBJECT, sender=sender, name="PRIVATE-NAME-MARKER",
+                           internet_id="<p1@mail.secret-company.example>")
+        outlook = PretendOutlook(leads=[message], **outlook_options)
+        gemini = PretendGemini({self.PRIVATE_SUBJECT: info(
+            name="PRIVATE-LEAD-NAME", email=sender, company="PRIVATE-COMPANY-MARKER",
+            role="PRIVATE-ROLE-MARKER", summary="PRIVATE-SUMMARY-MARKER")})
+        return outlook, PretendAttio(), gemini
+
+    def assert_nothing_private(self, output):
+        for word in self.PRIVATE_WORDS:
+            self.assertNotIn(word, output, "something private was printed")
+            self.assertNotIn(word, self.saved_text(), "something private was saved to a file")
+
+    def test_p1_a_live_run_prints_only_ids_steps_and_counts(self):
+        outlook, attio, gemini = self.private_world()
+        short = outlook_triage.short_id(outlook.leads["p1"])
+        code, output = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        lines = output.splitlines()
+        self.assertEqual(lines[lines.index(f"Email: {short}"):][:6], [
+            f"Email: {short}",
+            "  created person",
+            "  created company",
+            "  created deal (stage New, owner set)",
+            "  added a note to the new deal",
+            "  moved the email to Leads/Processed",
+        ])
+        for line in ("Leads handled: 1", "People created: 1", "Companies created: 1", "Deals created: 1"):
+            self.assertIn(line, lines)
+        self.assert_nothing_private(output)
+        # what the step is FOR still holds the details: Attio and its note
+        (pid,) = attio.person_ids(self.PRIVATE_SENDER)
+        self.assertEqual(attio.people[pid]["name"], "PRIVATE-LEAD-NAME")
+        (note,) = attio.notes
+        self.assertIn("PRIVATE-SUMMARY-MARKER", note["content"])
+        self.assertIn(self.PRIVATE_SUBJECT, note["content"])
+
+    def test_p2_a_dry_run_says_what_it_would_do_without_naming_anyone(self):
+        outlook, attio, gemini = self.private_world()
+        code, output = self.dry(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        for line in ("  would create person", "  would create company", "  would create deal (stage New, owner set)",
+                     "  would add a note to the new deal", "  would move the email to Leads/Processed"):
+            self.assertIn(line, output.splitlines())
+        self.assert_nothing_private(output)
+
+    def test_p3_existing_records_are_found_without_naming_them(self):
+        outlook, attio, gemini = self.private_world()
+        cid = attio.add_company("PRIVATE-EXISTING-COMPANY", "secret-company.example")
+        pid = attio.add_person(self.PRIVATE_SENDER, "PRIVATE-EXISTING-PERSON", "PRIVATE-EXISTING-JOB", cid)
+        attio.add_deal("PRIVATE-EXISTING-DEAL: demo", "New", person=pid, company=cid)
+        for argv in (["--live"], []):
+            with self.subTest(argv=argv):
+                self.state_path.unlink(missing_ok=True)
+                code, output = self.run_main(outlook, attio, gemini, argv)
+                self.assertEqual(code, 0)
+                lines = output.splitlines()
+                self.assertTrue(any(line in lines for line in ("  found person", "  person already exists")))
+                self.assertIn("  company already exists", lines)
+                self.assertTrue(any(line in lines for line in ("  adding a note to the existing New deal",
+                                                                "  would add a note to the existing New deal")))
+                self.assert_nothing_private(output)
+                self.assertNotIn("PRIVATE-EXISTING", output)
+                outlook.leads["p1"] = lead_msg("p1", self.PRIVATE_SUBJECT, sender=self.PRIVATE_SENDER,
+                                               name="PRIVATE-NAME-MARKER", internet_id="<p1@mail.secret-company.example>")
+
+    def test_p4_a_free_mail_lead_says_there_is_no_company_and_nothing_else(self):
+        # a free-mail domain is needed for this case; the local part is plainly fake and carries the private marker
+        outlook, attio, gemini = self.private_world(sender="private.person.fake.test@gmail.com")
+        code, output = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn("  no company: free-mail domain", output.splitlines())
+        self.assert_nothing_private(output)
+
+    def test_p5_the_other_lines_use_ids_only(self):
+        # a lead with no saved answer, one already handled, and a system email
+        done = lead_msg("d1", self.PRIVATE_SUBJECT + " done", sender=self.PRIVATE_SENDER, name="PRIVATE-NAME-MARKER")
+        system = lead_msg("s1", self.PRIVATE_SUBJECT + " verification code", sender="noreply@secret-company.example",
+                          name="PRIVATE-NAME-MARKER")
+        waiting = lead_msg("w1", self.PRIVATE_SUBJECT + " nothing saved", sender=self.PRIVATE_SENDER, name="PRIVATE-NAME-MARKER")
+        outlook = PretendOutlook(leads=[done, system, waiting])
+        gemini = PretendGemini({self.PRIVATE_SUBJECT + " done": info(name="PRIVATE-LEAD-NAME", email=self.PRIVATE_SENDER)})
+        attio = PretendAttio()
+        self.live(outlook, attio, gemini)                   # handles d1, notes s1, marks w1 "needs a person"
+        outlook.add_lead(done)                              # d1 back in Leads, same id
+        code, output = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        lines = output.splitlines()
+        self.assertIn(f"Already handled earlier, left alone: {outlook_triage.short_id(done)}", lines)
+        self.assertIn(f"Skipped (system or security email): {outlook_triage.short_id(system)}", lines)
+        self.assertIn(f"Still needs a person: {outlook_triage.short_id(waiting)} ({leads_to_attio.NO_ANSWER})", lines)
+        self.assert_nothing_private(output)
+        code, output = self.live(outlook, attio, gemini, "--retry-attention")
+        self.assertIn(f"  Needs a person to look at it: {outlook_triage.short_id(waiting)} ({leads_to_attio.NO_ANSWER})",
+                      output.splitlines())
+        self.assert_nothing_private(output)
+
+    def test_p6_filter_text_is_not_echoed_back(self):
+        outlook, attio, gemini = self.private_world()
+        for argv in (["--only-subject", "PRIVATE-FILTER-NOBODY-HAS"],
+                     ["--only-from", "private-filter-nobody@secret-company.example"],
+                     ["--only-subject", "PRIVATE-FILTER-NOBODY-HAS", "--only-from", "private-filter-nobody@secret-company.example"]):
+            with self.subTest(argv=argv):
+                code, output = self.live(outlook, attio, gemini, *argv)
+                self.assertEqual(code, 0)
+                self.assertNotIn("PRIVATE-FILTER", output.upper().replace("--ONLY", ""))
+                self.assertNotIn("private-filter", output)
+                self.assertIn("Nothing was changed.", output)
+        code, output = self.live(outlook, attio, gemini, "--only-subject", "PRIVATE-FILTER-NOBODY-HAS")
+        self.assertIn("No lead matching the --only-subject text was found. Nothing was changed.", output)
+
+    def test_p7_the_same_id_is_used_by_the_triage_and_this_step(self):
+        message = lead_msg("p1", self.PRIVATE_SUBJECT, internet_id="<stable@mail.secret-company.example>")
+        moved = lead_msg("p1-after-the-move", self.PRIVATE_SUBJECT, internet_id="<stable@mail.secret-company.example>")
+        self.assertEqual(outlook_triage.short_id(message), outlook_triage.short_id(moved))
+        outlook, attio, gemini = self.private_world()
+        outlook.leads["p1"]["internetMessageId"] = "<stable@mail.secret-company.example>"
+        code, output = self.dry(outlook, attio, gemini)
+        self.assertIn(f"Email: {outlook_triage.short_id(message)}", output.splitlines())
+
+    def test_p8_the_leads_listing_asks_for_the_message_id_header(self):
+        outlook, attio, gemini = self.private_world()
+        self.dry(outlook, attio, gemini)
+        listing = [r for r in outlook.requests if r.full_url.split("?")[0].endswith("/leads-id/messages")]
+        self.assertTrue(listing)
+        self.assertTrue(all("internetMessageId" in r.full_url for r in listing))
+
+    def test_p9_no_failure_message_holds_a_sender_a_name_a_company_a_deal_a_subject_or_an_answer(self):
+        leaky = f"LEAKY PRIVATE-SUMMARY-MARKER {self.PRIVATE_SENDER} PRIVATE-LEAD-NAME"
+        scenarios = {
+            "attio refuses the person": lambda o, a: a.fail("POST", "/v2/objects/people/records", Status(400, leaky)),
+            "attio refuses the company": lambda o, a: a.fail("POST", "/v2/objects/companies/records", Status(422, leaky)),
+            "attio refuses the deal": lambda o, a: a.fail("POST", "/v2/objects/deals/records", Status(400, leaky)),
+            "attio refuses the note": lambda o, a: a.fail("POST", "/v2/notes", Status(403, leaky)),
+            "attio is busy": lambda o, a: a.fail("POST", "/v2/objects/people/records", Status(503, leaky)),
+            "attio is slow": lambda o, a: a.fail("POST", "/v2/objects/people/records", Raise(requests.exceptions.Timeout(leaky))),
+            "attio limit reached": lambda o, a: [a.fail("POST", "/v2/objects/people/records/query", Status(429, leaky)) for _ in range(2)],
+            "the saved answer cannot be read": lambda o, a: setattr(o, "read_error", http_error(500)),
+            "outlook refuses the move": lambda o, a: o.move_errors.update({1: http_error(500)}),
+        }
+        for name, break_it in scenarios.items():
+            with self.subTest(case=name):
+                self.state_path.unlink(missing_ok=True)
+                outlook, attio, gemini = self.private_world()
+                break_it(outlook, attio)
+                code, output = self.live(outlook, attio, gemini)
+                self.assertEqual(code, 1)
+                self.assert_nothing_private(output)
+
+    def test_p10_the_scheduler_log_gets_nothing_but_this_output(self):
+        text = (PROJECT_ROOT / "workflows" / "02-email-to-attio" / "run_leads_to_attio.bat").read_text(encoding="utf-8")
+        self.assertIn("leads_to_attio.py --live >> \"%LOG%\" 2>&1", text)
+        for line in text.splitlines():
+            if ">>" in line:
+                self.assertTrue(line.startswith(("echo ===== %date% %time%", "echo exit code:", "%PY% workflows")), line)
 
 
 if __name__ == "__main__":

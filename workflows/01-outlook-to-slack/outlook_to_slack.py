@@ -229,9 +229,10 @@ def run(live, limit=DEFAULT_LIMIT):
         print("No emails found in the Leads folder. Nothing to post.")
         return 0
 
+    # What is printed names no sender and no subject, only a number and a count (the Slack post itself still has them).
     if not live:
-        for sender, subject in leads:
-            print(f"would post: {sender}, {subject}")
+        for number in range(1, len(leads) + 1):
+            print(f"would post: message {number} of {len(leads)}")
         print(f"Dry run finished: {len(leads)} email(s) would be posted. Add --live to post.")
         return 0
 
@@ -247,7 +248,7 @@ def run(live, limit=DEFAULT_LIMIT):
             )
             return 1
         posted += 1
-        print(f"posted: {sender}, {subject}")
+        print(f"posted: message {posted} of {len(leads)}")
     print(f"Done: {posted} message(s) posted to Slack #leads.")
     return 0
 

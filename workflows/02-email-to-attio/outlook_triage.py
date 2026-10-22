@@ -14,7 +14,8 @@ lead (see reply_drafts.py), addressed only to the sender, once, before the categ
 email is moved; drafts are off by default and a draft is never sent. A lead that should get no draft
 (for example a forwarded enquiry) carries on, and the output says plainly why. Not a lead and Needs
 review emails stay in the Inbox and get nothing saved. Handled emails are remembered in a small state file (triage-state.json, next to this
-script, git-ignored) so nothing is handled twice. The state file holds no lead details.
+script, git-ignored) so nothing is handled twice. The state file holds no lead details: only Outlook IDs, the
+category, the stage, a date and each email's short ID (never a sender, name, subject or Message-ID header).
 
 Dry run by default: it only lists the emails it would send to Gemini and changes
 nothing. Add --live to write to Outlook. It never sends, replies to everyone, forwards,
@@ -22,6 +23,10 @@ copies or deletes anything. The only changes it asks Outlook for are adding a
 category, saving the answer (and the small once-only markers) on a lead's email, making
 the reply draft (only with --drafts on), and moving a lead to the Leads folder.
 No token or key is ever printed, and no lead detail or draft text is printed or kept in a file.
+Nothing it prints names a sender, a person, a subject or any email text: an email is named by a short
+ID (see short_id), and the rest of the output is counts, categories and plain steps. So the scheduler's
+log holds none of that either. (The Slack post, the reply draft and the saved answer do hold the lead's
+details, because that is what they are for.)
 
 Run:  python workflows\\02-email-to-attio\\outlook_triage.py
       python workflows\\02-email-to-attio\\outlook_triage.py --only-subject "TRIAGE-TEST"
@@ -35,6 +40,7 @@ Needs: MS_CLIENT_ID and MS_TOKEN_CACHE (run outlook_signin.py once first), the m
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -210,6 +216,22 @@ def sender_of(message):
     return address.get("address") or address.get("name") or "(unknown sender)", address.get("name") or ""
 
 
+def short_id(message):
+    """A short code that names an email in the output without saying anything about it, such as e-1a2b3c.
+
+    It is made from the email's own Message-ID header, which stays the same when the email is moved (Outlook's
+    own ID changes on a move), or from Outlook's ID if there is no header. It cannot be turned back into the
+    sender or the subject, so it is safe to print and to keep in a log. The triage and the Attio step use the
+    same code, so one email is named the same way in both.
+    """
+    return short_code(message.get("internetMessageId") or message.get("id") or "")
+
+
+def short_code(basis):
+    """The short ID for a Message-ID header (or an Outlook ID): "e-" and six letters or digits."""
+    return "e-" + hashlib.sha1(str(basis).encode("utf-8")).hexdigest()[:6]
+
+
 def one_line(text):
     return " ".join((text or "").split())
 
@@ -292,24 +314,37 @@ def load_state(live):
         return fresh_state(), note
 
 
+def drop_message_ids(state):
+    """Replace any Message-ID header an older state file still holds by the short ID made from it.
+
+    The header can contain the sender's mail domain, so it is not kept. The short ID is the same one the output
+    uses, so an old record keeps the name it always had. Nothing else about a record changes.
+    """
+    for entry in (state.get("emails") or {}).values():
+        if isinstance(entry, dict) and "internet_message_id" in entry:
+            header = entry.pop("internet_message_id")
+            if header and "short_id" not in entry:
+                entry["short_id"] = short_code(header)
+
+
 def save_state(state):
     """Write the whole file to a copy first, then swap it in."""
+    drop_message_ids(state)
     temp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
     temp.write_text(json.dumps(state, indent=2), encoding="utf-8")
     os.replace(temp, STATE_PATH)
 
 
-def record(state, message_id, category, stage, urgency, internet_message_id=None):
+def record(state, message_id, category, stage, urgency, short):
     state["emails"][message_id] = {
         "outcome": category,
         "stage": stage,
         "urgency": urgency,
         "date": now().date().isoformat(),
+        # The email's short ID, made from its own Message-ID header (which is not kept: it can name the sender's
+        # mail domain). The same ID is printed, so a log line can be matched to its record.
+        "short_id": short,
     }
-    if internet_message_id:
-        # The email's own Message-ID header. Unlike the Outlook ID, it does not change when the
-        # email is moved, so later steps (the Attio script) can recognise the email in Leads.
-        state["emails"][message_id]["internet_message_id"] = internet_message_id
     save_state(state)
 
 
@@ -355,9 +390,8 @@ def dry_run(model, prompt_version, eligible, skipped, waiting, slack_mode="off",
     if drafts_mode == "on":
         print("Reply drafts: on (nothing is made in a dry run)")
     for message, kind in eligible:
-        address, _ = sender_of(message)
         action = "would send to Gemini" if kind == "new" else "would retry moving to Leads"
-        print(f"{action}: {address}, {subject_of(message)}")
+        print(f"{action}: {short_id(message)}")
     print(
         f"Dry run finished: {len(eligible)} email(s) would be handled "
         f"({skipped} skipped, {waiting} still waiting). Add --live to do it for real."
@@ -402,17 +436,16 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
     posted = 0
     drafts_made = 0
     drafts_skipped = 0
+    current = None
     try:
         for message, kind in eligible:
-            address, _ = sender_of(message)
-            subject = subject_of(message)
-            label = f'"{subject}"'
+            current = label = short_id(message)     # emails are named by a short ID only, never by sender or subject
             if kind == "retry":
                 category = state["emails"][message["id"]]["outcome"]
                 move_to_leads(token, message, leads_id, label)
                 state["emails"][message["id"]]["stage"] = "done"
                 save_state(state)
-                print(f"{address}, {subject}: moved to Leads (retry)")
+                print(f"{label}: moved to Leads (retry)")
             else:
                 if asked:
                     time.sleep(extract_leads.PAUSE_SECONDS)
@@ -450,19 +483,20 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
                             drafts_skipped += 1
                             print(f"  no reply draft was made: {reason}.")
                 add_category(token, message, category)
-                record(state, message["id"], category, "categorised" if is_lead else "done", urgency,
-                       message.get("internetMessageId"))
+                record(state, message["id"], category, "categorised" if is_lead else "done", urgency, label)
                 if is_lead:
                     move_to_leads(token, message, leads_id, label)
                     state["emails"][message["id"]]["stage"] = "done"
                     save_state(state)
-                print(f"{address}, {subject}: {category}" + (", moved to Leads" if is_lead else ""))
+                print(f"{label}: {category}" + (", moved to Leads" if is_lead else ""))
                 if is_lead and result["draft_reply"] is None:
                     print("  no usable draft was written for this lead, so a person will need to write the reply")
             counts[category] = counts.get(category, 0) + 1
             handled += 1
     except PROBLEMS as problem:
         print(problem)
+        if current:
+            print(f"The email being handled was {current}.")
         print(f"Stopped. {handled} email(s) were handled before this. The rest were left untouched.")
         return 1
 
@@ -513,14 +547,14 @@ def run(live, only_subject, prompt_version, slack_mode="off", drafts_mode="off")
     reported_before = reported_before if isinstance(reported_before, dict) else {}
     new_system = [m for m in system if m["id"] not in reported_before]
     for message in new_system:
-        print(f"Skipped (system or security email): {subject_of(message)}")
+        print(f"Skipped (system or security email): {short_id(message)}")
     system_already = len(system) - len(new_system)
     if live:
         remember_system_emails(state, new_system)
 
     if not eligible:
         if only_subject is not None and not system:
-            print(f'No new email with "{only_subject.strip()}" in the subject was found. Nothing was changed.')
+            print("No new email matching the --only-subject filter was found. Nothing was changed.")
         else:
             print(f"No new emails to handle. Skipped {skipped} that were already handled or tagged.")
         print_system_count(len(system), system_already)

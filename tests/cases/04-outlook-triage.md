@@ -4,6 +4,8 @@ Written before any code. Each case says what goes in and what should happen.
 All emails are pretend. A pretend Outlook and a pretend Gemini are used for every test, so no real mailbox is touched and no real AI call is made.
 No real keys or tokens appear in this file.
 
+> **Update (22 Oct).** Wherever a case below says the output shows an email's sender address and subject, it now shows only a short ID such as `e-1a2b3c`, the category and counts, and a `--only-subject` filter is no longer echoed back. See 16-private-output.md. (The default prompt is also v3 now, see 10-single-call-v3.md.)
+
 What the script does: it reads new emails in the Outlook Inbox, asks Gemini (prompt v2, model from config.json) whether each one is a lead, what it asks for and how urgent it is, then writes the answer back to Outlook. It adds one category (Lead - Demo, Lead - Pricing, Lead - Other, Not a lead or Needs review) and moves real leads into the Leads folder. Not a lead and Needs review emails stay in the Inbox. It remembers handled emails in a small state file so nothing is handled twice. It never sends or replies to anything.
 
 Some expected results depend on the "Decisions for Ilmah" at the end of this file. Those decisions were settled on 21 Oct, and the cases use them.
@@ -277,13 +279,19 @@ Some expected results depend on the "Decisions for Ilmah" at the end of this fil
 - Input: the same words before the @, such as "do-not-reply@something.com" or "info-security-team@example.com".
 - Expected: they are skipped, as in Case 31.
 
-## Case 43: the triage records each email's own message ID
+## Case 43: the triage records each email's short ID, not its message ID
+
+(Changed on 22 Oct. This case used to keep the email's Message-ID header in the state file, so the Attio step could recognise the email after the move. The Attio step no longer reads it, and a Message-ID header can contain the sender's mail domain, so it is no longer kept. See 16-private-output.md.)
 
 - Input: a live run that handles an email, which carries a Message-ID header (internetMessageId).
-- Expected: the record in the state file includes that message ID, so the Attio step can recognise the email after the triage moves it to Leads (the Outlook ID changes when an email is moved, the Message-ID header does not).
-- Expected: the message ID is only an identifier. No email text is saved.
-- Input: an email with no message ID, or a state file from before this change.
-- Expected: nothing breaks. The record simply has no message ID, and older records keep working as before.
+- Expected: the record in the state file holds the email's short ID (for example `e-1a2b3c`, made from that header), the same ID the output prints, so a log line can be matched to its record. The header itself is not kept: no part of it, and nothing with an "@", is in the file.
+- Expected: no email text is saved.
+- Input: an email with no message ID.
+- Expected: the short ID is made from its Outlook ID instead, and nothing breaks.
+- Input: a state file from before this change, with no short IDs.
+- Expected: it loads, and its records keep working as before. A record is not given a short ID it never had.
+- Input: a state file from before this change that still holds Message-ID headers.
+- Expected: the next time the state is saved, each header is replaced by the short ID made from it (so that email keeps the name it always had), and nothing else about the record changes. A dry run never rewrites the file.
 
 ## Case 44: a system or security email is reported once, not on every run
 
