@@ -28,6 +28,11 @@ ID (see short_id), and the rest of the output is counts, categories and plain st
 log holds none of that either. (The Slack post, the reply draft and the saved answer do hold the lead's
 details, because that is what they are for.)
 
+With --stateless it keeps no state file at all (none is read, none is written): the mailbox is the memory, through
+the categories on the emails, the hidden markers on them and the Leads folder. A lead that was categorised but could
+not be moved is recognised by its category and just moved to Leads. This is how it runs on GitHub Actions, where each
+run starts on a fresh machine. System and security emails are only counted, never listed.
+
 Run:  python workflows\\02-email-to-attio\\outlook_triage.py
       python workflows\\02-email-to-attio\\outlook_triage.py --only-subject "TRIAGE-TEST"
       python workflows\\02-email-to-attio\\outlook_triage.py --live --only-subject "TRIAGE-TEST"
@@ -66,6 +71,7 @@ from outlook_signin import get_client_id, read_env_text  # noqa: E402
 from outlook_to_slack import GRAPH_URL, WEB_TIMEOUT_SECONDS, find_leads_folder, get_access_token  # noqa: E402
 
 STATE_PATH = HERE / "triage-state.json"
+STATELESS = False       # set by each run from --stateless: no state file is read or written, the mailbox is the memory
 LOOKBACK_DAYS = 7
 MAX_PER_RUN = 25
 MAX_PAGES = 10
@@ -252,6 +258,22 @@ def has_our_category(message):
     return any((c or "").strip().lower() in ours for c in (message.get("categories") or []))
 
 
+LEAD_CATEGORY_NAMES = {name.lower(): name for name in v3_reply.LEAD_CATEGORIES}
+
+
+def lead_category_of(message):
+    """The lead category already on an email (Lead - Demo, Lead - Pricing or Lead - Other), or None.
+
+    Capitals and extra spaces are ignored. An email in the Inbox that carries one is a lead whose move to Leads
+    did not happen, so it only needs moving: the mailbox itself says so, no state file is needed.
+    """
+    for name in message.get("categories") or []:
+        found = LEAD_CATEGORY_NAMES.get(" ".join(str(name or "").split()).lower())
+        if found:
+            return found
+    return None
+
+
 def is_system_email(message):
     """True for system or security emails, judged by sender address and subject only.
 
@@ -290,7 +312,12 @@ def start_note():
 
 
 def load_state(live):
-    """Returns (state, note). Missing or damaged files start safely, never the whole old Inbox."""
+    """Returns (state, note). Missing or damaged files start safely, never the whole old Inbox.
+
+    With --stateless no file is read at all: the run starts empty and says nothing about it.
+    """
+    if STATELESS:
+        return fresh_state(), None
     if not STATE_PATH.exists():
         return fresh_state(), f"Starting fresh: there is no state file yet. Looking only at emails from {start_note()}."
     try:
@@ -314,12 +341,14 @@ def load_state(live):
         return fresh_state(), note
 
 
-def drop_message_ids(state):
-    """Replace any Message-ID header an older state file still holds by the short ID made from it.
+def tidy_state(state):
+    """Drop what an older state file holds that is no longer kept.
 
-    The header can contain the sender's mail domain, so it is not kept. The short ID is the same one the output
-    uses, so an old record keeps the name it always had. Nothing else about a record changes.
+    A Message-ID header is replaced by the short ID made from it (the header can contain the sender's mail domain;
+    the short ID is the same one the output uses, so an old record keeps the name it always had). The list of
+    reported system emails is dropped (they are only counted now). Nothing else about a record changes.
     """
+    state.pop("system_skipped", None)
     for entry in (state.get("emails") or {}).values():
         if isinstance(entry, dict) and "internet_message_id" in entry:
             header = entry.pop("internet_message_id")
@@ -328,8 +357,10 @@ def drop_message_ids(state):
 
 
 def save_state(state):
-    """Write the whole file to a copy first, then swap it in."""
-    drop_message_ids(state)
+    """Write the whole file to a copy first, then swap it in. With --stateless nothing is written."""
+    if STATELESS:
+        return
+    tidy_state(state)
     temp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
     temp.write_text(json.dumps(state, indent=2), encoding="utf-8")
     os.replace(temp, STATE_PATH)
@@ -372,7 +403,11 @@ def choose_emails(messages, state, since, only_subject):
         entry = state["emails"].get(message_id)
         if entry and entry.get("stage") == "categorised":
             eligible.append((message, "retry"))
-        elif entry or has_our_category(message):
+        elif entry:
+            skipped += 1
+        elif lead_category_of(message):
+            eligible.append((message, "retry"))      # a lead still in the Inbox: its move failed, just move it
+        elif has_our_category(message):
             skipped += 1
         elif is_system_email(message):
             system.append(message)
@@ -399,34 +434,12 @@ def dry_run(model, prompt_version, eligible, skipped, waiting, slack_mode="off",
     return 0
 
 
-def print_system_count(count, already=0):
-    suffix = f" ({already} already reported earlier)" if already else ""
-    print(f"System or security emails skipped: {count}{suffix}")
+def print_system_count(count):
+    """System and security emails are left completely untouched and only counted, never listed."""
+    print(f"System or security emails skipped: {count}")
 
 
-def remember_system_emails(state, new_system):
-    """Note which system emails have been reported, so later runs do not print them again.
-
-    This is a separate list in the state file, never an entry among the handled emails, and the
-    emails themselves stay completely untouched. Old notes are forgotten so the list stays small.
-    """
-    reported = state.get("system_skipped")
-    if not isinstance(reported, dict):
-        reported = state["system_skipped"] = {}
-    today = now().date()
-    changed = False
-    for message in new_system:
-        reported[message["id"]] = today.isoformat()
-        changed = True
-    cutoff = (today - datetime.timedelta(days=2 * LOOKBACK_DAYS)).isoformat()
-    for message_id in [i for i, date in reported.items() if str(date) < cutoff]:
-        del reported[message_id]
-        changed = True
-    if changed:
-        save_state(state)
-
-
-def live_run(token, key, model, prompt, state, eligible, skipped, waiting, system_count, system_already=0,
+def live_run(token, key, model, prompt, state, eligible, skipped, waiting, system_count,
              slack_url=None, slack_mode="off", drafts_mode="off"):
     leads_id = find_leads_folder(token)   # stops here, before any change, if there is no Leads folder
     counts = {}
@@ -441,10 +454,14 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
         for message, kind in eligible:
             current = label = short_id(message)     # emails are named by a short ID only, never by sender or subject
             if kind == "retry":
-                category = state["emails"][message["id"]]["outcome"]
+                entry = state["emails"].get(message["id"])
+                category = entry["outcome"] if entry else lead_category_of(message)
                 move_to_leads(token, message, leads_id, label)
-                state["emails"][message["id"]]["stage"] = "done"
-                save_state(state)
+                if entry:
+                    entry["stage"] = "done"
+                    save_state(state)
+                else:
+                    record(state, message["id"], category, "done", None, label)
                 print(f"{label}: moved to Leads (retry)")
             else:
                 if asked:
@@ -506,7 +523,7 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
         if counts.get(category):
             print(f"  {category}: {counts[category]}")
     print(f"Skipped (already handled or already tagged): {skipped}")
-    print_system_count(system_count, system_already)
+    print_system_count(system_count)
     print(f"Broken replies: {broken}")
     if slack_url:
         print(f"Posted to Slack ({slack_mode}): {posted}")
@@ -519,7 +536,9 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
     return 0
 
 
-def run(live, only_subject, prompt_version, slack_mode="off", drafts_mode="off"):
+def run(live, only_subject, prompt_version, slack_mode="off", drafts_mode="off", stateless=False):
+    global STATELESS
+    STATELESS = bool(stateless)       # set on every run, so one run never leaks its setting into the next
     if only_subject is not None and not only_subject.strip():
         raise SignInProblem(
             "The --only-subject text must not be empty, because empty text would match every email."
@@ -541,30 +560,20 @@ def run(live, only_subject, prompt_version, slack_mode="off", drafts_mode="off")
     waiting = max(0, len(eligible) - MAX_PER_RUN)
     eligible = eligible[:MAX_PER_RUN]
 
-    # System and security emails are left completely untouched. Each is reported once, the first time
-    # it is seen. Those reported on an earlier run are only counted, so the log stays quiet.
-    reported_before = state.get("system_skipped")
-    reported_before = reported_before if isinstance(reported_before, dict) else {}
-    new_system = [m for m in system if m["id"] not in reported_before]
-    for message in new_system:
-        print(f"Skipped (system or security email): {short_id(message)}")
-    system_already = len(system) - len(new_system)
-    if live:
-        remember_system_emails(state, new_system)
-
+    # System and security emails are left completely untouched, and only counted.
     if not eligible:
         if only_subject is not None and not system:
             print("No new email matching the --only-subject filter was found. Nothing was changed.")
         else:
             print(f"No new emails to handle. Skipped {skipped} that were already handled or tagged.")
-        print_system_count(len(system), system_already)
+        print_system_count(len(system))
         return 0
 
     if not live:
         code = dry_run(model, prompt_version, eligible, skipped, waiting, slack_mode, drafts_mode)
-        print_system_count(len(system), system_already)
+        print_system_count(len(system))
         return code
-    return live_run(token, key, model, prompt, state, eligible, skipped, waiting, len(system), system_already,
+    return live_run(token, key, model, prompt, state, eligible, skipped, waiting, len(system),
                     slack_url, slack_mode, drafts_mode)
 
 
@@ -594,18 +603,24 @@ def main():
         default="off",
         help="make one reply draft in Drafts for each lead (never sent): off (default) or on",
     )
+    parser.add_argument(
+        "--stateless",
+        action="store_true",
+        help="keep no state file at all: the mailbox (categories, markers, folders) is the memory (for GitHub Actions)",
+    )
     args = parser.parse_args()
 
     try:
-        return run(args.live, args.only_subject, args.prompt, args.slack, args.drafts)
+        return run(args.live, args.only_subject, args.prompt, args.slack, args.drafts, args.stateless)
     except PROBLEMS as problem:
         print(problem)
         return 1
     except Exception as unexpected:
         # Only the kind of error is shown, in case details contain secrets.
+        memory = "The mailbox" if STATELESS else "The state file"
         print(
             f"Something unexpected went wrong ({type(unexpected).__name__}). "
-            "The state file shows which emails were already handled."
+            f"{memory} shows which emails were already handled."
         )
         return 1
 

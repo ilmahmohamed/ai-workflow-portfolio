@@ -4,6 +4,8 @@ Written before any code. Each case says what goes in and what should happen.
 All emails are pretend. A pretend Outlook and a pretend Gemini are used for every test, so no real mailbox is touched and no real AI call is made.
 No real keys or tokens appear in this file.
 
+> **Update (22 Oct, for GitHub Actions).** The triage can run with `--stateless` (no state file at all, the mailbox is the memory). Three things changed, see 17-actions-readiness.md: an email in the Inbox that already carries a lead category (Lead - Demo, Pricing or Other) is a lead whose move failed, so it is just moved to Leads (Cases 18 and 21 to 23 still hold for the other categories); system and security emails are only counted and never listed or remembered (Cases 35, 44 and 45 are replaced); and the state file keeps no list of reported system emails.
+>
 > **Update (22 Oct).** Wherever a case below says the output shows an email's sender address and subject, it now shows only a short ID such as `e-1a2b3c`, the category and counts, and a `--only-subject` filter is no longer echoed back. See 16-private-output.md. (The default prompt is also v3 now, see 10-single-call-v3.md.)
 
 What the script does: it reads new emails in the Outlook Inbox, asks Gemini (prompt v2, model from config.json) whether each one is a lead, what it asks for and how urgent it is, then writes the answer back to Outlook. It adds one category (Lead - Demo, Lead - Pricing, Lead - Other, Not a lead or Needs review) and moves real leads into the Leads folder. Not a lead and Needs review emails stay in the Inbox. It remembers handled emails in a small state file so nothing is handled twice. It never sends or replies to anything.

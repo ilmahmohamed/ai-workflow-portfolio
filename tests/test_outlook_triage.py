@@ -938,7 +938,10 @@ class TriageTests(unittest.TestCase):
     # ---- Case 18: already has one of our four categories ----------------------------------------------------------------------------
 
     def test_case18_emails_with_our_categories_are_skipped(self):
-        inbox = [msg(f"m{i}", f"Subject {i}", categories=[name]) for i, name in enumerate(OUR_CATEGORIES)]
+        # Not a lead and Needs review stay in the Inbox and are left alone. (An email in the Inbox with a LEAD
+        # category is a lead whose move failed: it is moved, see Case S2 in 17-actions-readiness.md.)
+        stay = [name for name in OUR_CATEGORIES if name in ("Not a lead", "Needs review")]
+        inbox = [msg(f"m{i}", f"Subject {i}", categories=[name]) for i, name in enumerate(stay)]
         inbox.append(msg("lower", "Lower case", categories=["needs review"]))
         outlook = PretendOutlook(inbox)
         gemini = PretendGemini()
@@ -1165,7 +1168,7 @@ class TriageTests(unittest.TestCase):
             self.assertNotIn(message["id"], self.state()["emails"])
         self.assertEqual(outlook.where(message["id"]), "inbox")
         self.assertEqual(outlook.categories(message["id"]), message["categories"])
-        self.assertIn(f"Skipped (system or security email): {outlook_triage.short_id(message)}", output)
+        self.assertNotIn("Skipped (system or security email)", output, "system emails are counted, never listed")
         self.assertIn("System or security emails skipped: 1", output)
         return output
 
@@ -1256,8 +1259,9 @@ class TriageTests(unittest.TestCase):
         gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
         code, output = self.live(outlook, gemini)
         self.assertEqual(code, 0)
-        self.assertIn(f"Skipped (system or security email): {ref('s1')}", output)
-        self.assertIn(f"Skipped (system or security email): {ref('s2')}", output)
+        self.assertNotIn("Skipped (system or security email)", output)
+        self.assertNotIn(ref("s1"), output)
+        self.assertNotIn(ref("s2"), output)
         self.assertIn("System or security emails skipped: 2", output)
         self.assertEqual(len(gemini.calls), 1)
         self.assertEqual(outlook.categories("s1"), [])
@@ -1273,8 +1277,7 @@ class TriageTests(unittest.TestCase):
         gemini = PretendGemini()
         code, output = self.run_main(outlook, gemini, [])
         self.assertEqual(code, 0)
-        self.assertIn(f"Skipped (system or security email): {ref('s1')}", output)
-        self.assertIn(f"Skipped (system or security email): {ref('s2')}", output)
+        self.assertNotIn("Skipped (system or security email)", output)
         self.assertIn("System or security emails skipped: 2", output)
         self.assertIn(f"would send to Gemini: {ref('n1')}", output)
         self.assertNotIn(f"would send to Gemini: {ref('s1')}", output)
@@ -1325,7 +1328,7 @@ class TriageTests(unittest.TestCase):
         gemini = PretendGemini()
         code, output = self.live(outlook, gemini, "--only-subject", "invoice")
         self.assertEqual(code, 0)
-        self.assertIn(f"Skipped (system or security email): {ref('a')}", output)
+        self.assertNotIn("Skipped (system or security email)", output)
         self.assertNotIn(ref("b"), output)
         self.assertIn("System or security emails skipped: 1", output)
         self.assertEqual(gemini.calls, [])
@@ -1435,7 +1438,9 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.state_path.read_bytes(), before)
 
-    # ---- Cases 44 and 45: a system email is reported once, not on every run ------------------
+    # ---- Cases 44 and 45 (replaced): system emails are counted on every run and never listed ----------
+    # (tests/cases/17-actions-readiness.md, Case S3: with no state file there is nothing to remember what was
+    #  reported, and a line per skipped email would repeat in the log every 15 minutes)
 
     def system_inbox(self):
         return PretendOutlook([
@@ -1443,80 +1448,57 @@ class TriageTests(unittest.TestCase):
             msg("n1", "Weekly newsletter", received="2026-10-20T09:00:00Z"),
         ])
 
-    def test_case44_a_system_email_is_reported_only_the_first_time(self):
+    def test_case44_system_emails_are_counted_on_every_run_and_never_listed(self):
         outlook = self.system_inbox()
         gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
-        code, first = self.live(outlook, gemini)
-        self.assertEqual(code, 0)
-        self.assertIn(f"Skipped (system or security email): {ref('s1')}", first)
-        self.assertIn("System or security emails skipped: 1", first)
-        code, second = self.live(outlook, gemini)
-        self.assertEqual(code, 0)
-        self.assertNotIn(f"Skipped (system or security email): {ref('s1')}", second)
-        self.assertIn("System or security emails skipped: 1 (1 already reported earlier)", second)
+        for run in (1, 2, 3):
+            with self.subTest(run=run):
+                code, output = self.live(outlook, gemini)
+                self.assertEqual(code, 0)
+                self.assertIn("System or security emails skipped: 1", output.splitlines())
+                self.assertNotIn("Skipped (system or security email)", output)
+                self.assertNotIn("already reported", output)
+                self.assertNotIn(ref("s1"), output)
         self.assertEqual(outlook.categories("s1"), [])
         self.assertEqual(outlook.where("s1"), "inbox")
         self.assertNotIn("s1", self.state()["emails"])
-        self.assertIn("s1", self.state()["system_skipped"])
+        self.assertNotIn("system_skipped", self.state())
 
-    def test_case44_a_new_system_email_is_reported_when_it_arrives(self):
+    def test_case44_a_new_system_email_is_counted_when_it_arrives(self):
         outlook = self.system_inbox()
         gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
         self.live(outlook, gemini)
         outlook.inbox["s2"] = msg("s2", "Your password was changed", received="2026-10-20T10:00:00Z")
         code, output = self.live(outlook, gemini)
         self.assertEqual(code, 0)
-        self.assertIn(f"Skipped (system or security email): {ref('s2')}", output)
-        self.assertNotIn(ref("s1"), output)
-        self.assertIn("System or security emails skipped: 2 (1 already reported earlier)", output)
+        self.assertIn("System or security emails skipped: 2", output.splitlines())
+        self.assertNotIn(ref("s2"), output)
 
-    def test_case44_a_dry_run_hides_reported_emails_and_never_changes_the_state(self):
-        outlook = self.system_inbox()
-        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
-        self.live(outlook, gemini)
-        before = self.state_path.read_bytes()
-        outlook.inbox["s2"] = msg("s2", "Your password was changed", received="2026-10-20T10:00:00Z")
-        code, output = self.run_main(outlook, gemini, [])
-        self.assertEqual(code, 0)
-        self.assertIn(f"Skipped (system or security email): {ref('s2')}", output)
-        self.assertNotIn(ref("s1"), output)
-        self.assertEqual(self.state_path.read_bytes(), before)
-
-    def test_case44_a_dry_run_on_a_fresh_state_reports_but_creates_no_file(self):
+    def test_case44_a_dry_run_counts_them_too_and_creates_no_file(self):
         outlook = self.system_inbox()
         code, output = self.run_main(outlook, PretendGemini(), [])
         self.assertEqual(code, 0)
-        self.assertIn(f"Skipped (system or security email): {ref('s1')}", output)
+        self.assertIn("System or security emails skipped: 1", output.splitlines())
+        self.assertNotIn(ref("s1"), output)
         self.assertFalse(self.state_path.exists())
 
-    def test_case45_old_memories_are_forgotten_and_recent_ones_kept(self):
+    def test_case45_an_older_state_file_with_the_reported_list_loses_it_on_the_next_save(self):
         self.state_path.write_text(json.dumps({
             "version": 1, "emails": {},
             "system_skipped": {"ancient": "2026-01-01", "recent": "2026-10-20"},
         }), encoding="utf-8")
-        outlook = self.system_inbox()
-        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
-        code, _ = self.live(outlook, gemini)
+        code, _ = self.live(self.system_inbox(), PretendGemini({"Weekly newsletter": NOT_LEAD}))
         self.assertEqual(code, 0)
-        remembered = self.state()["system_skipped"]
-        self.assertNotIn("ancient", remembered)
-        self.assertIn("recent", remembered)
-        self.assertIn("s1", remembered)
+        self.assertNotIn("system_skipped", self.state())
+        self.assertIn("n1", self.state()["emails"], "everything else about the state still works")
 
-    def test_case45_forgetting_old_memories_is_saved_even_when_nothing_else_happens(self):
-        self.state_path.write_text(json.dumps({
-            "version": 1, "emails": {}, "system_skipped": {"ancient": "2026-01-01"},
-        }), encoding="utf-8")
-        code, _ = self.live(PretendOutlook([]), PretendGemini())
+    def test_case45_a_dry_run_leaves_an_older_state_file_alone(self):
+        self.state_path.write_text(json.dumps({"version": 1, "emails": {}, "system_skipped": {"recent": "2026-10-20"}}),
+                                   encoding="utf-8")
+        before = self.state_path.read_bytes()
+        code, _ = self.run_main(self.system_inbox(), PretendGemini(), [])
         self.assertEqual(code, 0)
-        self.assertEqual(self.state()["system_skipped"], {})
-
-    def test_case45_a_state_file_without_the_list_gets_one_when_needed(self):
-        self.state_path.write_text(json.dumps({"version": 1, "emails": {}}), encoding="utf-8")
-        outlook = self.system_inbox()
-        code, _ = self.live(outlook, PretendGemini({"Weekly newsletter": NOT_LEAD}))
-        self.assertEqual(code, 0)
-        self.assertIn("s1", self.state()["system_skipped"])
+        self.assertEqual(self.state_path.read_bytes(), before)
 
     def test_prompt_v3_and_the_config_model_are_used(self):
         outlook = PretendOutlook([msg("m1", "Demo please")])
@@ -2441,7 +2423,8 @@ class TriageTests(unittest.TestCase):
                                       name="PRIVATE-NAME-MARKER")])
         code, output = self.live(outlook, PretendGemini())
         self.assertEqual(code, 0)
-        self.assertIn(f"Skipped (system or security email): {ref('s1')}", output.splitlines())
+        self.assertIn("System or security emails skipped: 1", output.splitlines())
+        self.assertNotIn(ref("s1"), output)
         self.assert_nothing_private(output)
 
     def test_p5_a_filter_text_is_not_echoed_back(self):
@@ -2538,6 +2521,130 @@ class TriageTests(unittest.TestCase):
         for line in text.splitlines():
             if ">>" in line:
                 self.assertTrue(line.startswith(("echo ===== %date% %time%", "echo exit code:", "%PY% workflows")), line)
+
+    # ==== Ready for GitHub Actions (tests/cases/17-actions-readiness.md) ===============================
+
+    def stuck_lead(self, categories=("Blue", "Lead - Demo"), **outlook_options):
+        """An email that was categorised as a lead but is still in the Inbox (its move failed)."""
+        return PretendOutlook([msg("m1", "Demo please", categories=list(categories))], **outlook_options)
+
+    def test_s1_stateless_reads_and_writes_no_state_file(self):
+        self.state_path.write_text(json.dumps({"version": 1, "emails": {"m1": {
+            "outcome": "Not a lead", "stage": "done", "urgency": None, "date": "2026-10-01", "short_id": "e-1a2b3c"}}}),
+            encoding="utf-8")
+        before = self.state_path.read_bytes()
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, output = self.live(outlook, gemini, "--stateless")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.state_path.read_bytes(), before, "the state file must be left exactly as it was")
+        self.assertEqual(len(gemini.calls), 1, "the old record is not used, so the email is handled")
+        self.assertEqual(outlook.where("m1"), "leads")
+        self.assertNotIn("Starting fresh", output)
+        self.assertEqual(sorted(path.name for path in self.tmp.iterdir()),
+                         [".env", "config.json", "prompts", "triage-state.json"], "no new file, not even a temporary one")
+
+    def test_s1_stateless_creates_no_file_when_there_is_none(self):
+        outlook = PretendOutlook([msg("m1", "Demo please"), msg("m2", "Weekly newsletter")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo"), "Weekly newsletter": NOT_LEAD})
+        code, output = self.live(outlook, gemini, "--stateless")
+        self.assertEqual(code, 0)
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(self.state_path.with_name(self.state_path.name + ".tmp").exists())
+        self.assertNotIn("Starting fresh", output)
+
+    def test_s1_without_the_switch_the_state_is_used_and_written_as_before(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn("Starting fresh", output)
+        self.assertIn("m1", self.state()["emails"])
+
+    def test_s1_the_switch_changes_nothing_in_a_dry_run_except_the_note(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        code, output = self.run_main(outlook, PretendGemini(), ["--stateless"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("Starting fresh", output)
+        self.assertIn(f"would send to Gemini: {ref('m1')}", output)
+        self.assertEqual(outlook.changes(), [])
+        self.assertFalse(self.state_path.exists())
+
+    def test_s2_a_stuck_lead_is_moved_without_state_gemini_slack_or_a_draft(self):
+        for argv in (["--stateless"], []):
+            with self.subTest(argv=argv):
+                self.state_path.unlink(missing_ok=True)
+                outlook = self.stuck_lead()
+                gemini = PretendGemini()           # any question to Gemini would fail the test
+                code, output = self.live(outlook, gemini, "--slack", "test", *self.DRAFTS, *argv)
+                self.assertEqual(code, 0)
+                self.assertEqual(gemini.calls, [])
+                self.assertEqual(outlook.moves, [("m1", {"destinationId": "leads-id"})])
+                self.assertEqual(outlook.patches, [], "no second category")
+                self.assertEqual(self.events, ["move"])
+                self.assertEqual(self.slack.attempts, 0, "the Slack post and the draft were made before the category")
+                self.assertEqual(outlook.drafts, {})
+                self.assertEqual(outlook.where("m1"), "leads")
+                self.assertEqual(outlook.categories("moved-m1"), ["Blue", "Lead - Demo"])
+                self.assertIn(f"{ref('m1')}: moved to Leads (retry)", output.splitlines())
+                self.assertIn("  Lead - Demo: 1", output.splitlines())
+
+    def test_s2_capitals_and_spaces_in_the_lead_category_do_not_matter(self):
+        for category in ("lead - demo", "  LEAD  -  PRICING ", "Lead - Other"):
+            with self.subTest(category=category):
+                outlook = self.stuck_lead(categories=(category,))
+                code, _ = self.live(outlook, PretendGemini(), "--stateless")
+                self.assertEqual(code, 0)
+                self.assertEqual(outlook.where("m1"), "leads")
+
+    def test_s2_emails_with_other_categories_are_left_alone(self):
+        outlook = PretendOutlook([
+            msg("a", "First", categories=["Not a lead"], received="2026-10-20T07:00:00Z"),
+            msg("b", "Second", categories=["Needs review"], received="2026-10-20T08:00:00Z"),
+            msg("c", "Third", categories=["Blue", "Lead - Demo-ish"], received="2026-10-20T09:00:00Z"),
+        ])
+        gemini = PretendGemini({"Third": lead_reply("demo")})
+        code, output = self.live(outlook, gemini, "--stateless")
+        self.assertEqual(code, 0)
+        self.assertEqual((outlook.where("a"), outlook.where("b")), ("inbox", "inbox"))
+        self.assertEqual([m[0] for m in outlook.moves], ["c"], "only the email without one of our categories is handled")
+        self.assertEqual(len(gemini.calls), 1)
+
+    def test_s2_a_finished_state_record_still_wins_in_a_normal_run(self):
+        self.state_path.write_text(json.dumps({"version": 1, "emails": {"m1": {
+            "outcome": "Lead - Demo", "stage": "done", "urgency": 1, "date": "2026-10-20", "short_id": "e-1a2b3c"}}}),
+            encoding="utf-8")
+        outlook = self.stuck_lead()
+        code, output = self.live(outlook, PretendGemini())
+        self.assertEqual(code, 0)
+        self.assertEqual(outlook.moves, [])
+        self.assertEqual(outlook.where("m1"), "inbox")
+
+    def test_s2_a_dry_run_says_it_would_retry_the_move_and_changes_nothing(self):
+        outlook = self.stuck_lead()
+        code, output = self.run_main(outlook, PretendGemini(), ["--stateless"])
+        self.assertEqual(code, 0)
+        self.assertIn(f"would retry moving to Leads: {ref('m1')}", output.splitlines())
+        self.assertEqual(outlook.changes(), [])
+
+    def test_s2_a_refused_move_is_finished_by_a_new_run_with_no_state_at_all(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")], move_errors={1: http_error(500)})
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, output = self.live(outlook, gemini, "--stateless", "--slack", "test", *self.DRAFTS)
+        self.assertEqual(code, 1)
+        self.assertIn("could not be moved", output)
+        self.assertEqual(outlook.where("m1"), "inbox")
+        self.assertEqual(outlook.categories("m1"), ["Lead - Demo"])
+        self.assertFalse(self.state_path.exists(), "nothing was remembered between the two runs")
+        # a new process: nothing from the first run is kept except what is in the mailbox
+        code, output = self.live(outlook, gemini, "--stateless", "--slack", "test", *self.DRAFTS, slack=self.slack)
+        self.assertEqual(code, 0)
+        self.assertEqual(outlook.where("m1"), "leads")
+        self.assertEqual(len(gemini.calls), 1, "Gemini is not asked again")
+        self.assertEqual(len(self.slack.posts), 1, "no second Slack post")
+        self.assertEqual(len(outlook.drafts), 1, "no second draft")
+        self.assertEqual(len(outlook.patches), 1, "no second category")
+        self.assertFalse(self.state_path.exists())
 
 
 if __name__ == "__main__":

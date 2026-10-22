@@ -1741,7 +1741,8 @@ class LeadsToAttioTests(unittest.TestCase):
         code, output = self.live(outlook, attio, gemini, "--only-from", "jo@nautspace.example")
         self.assertEqual(code, 0)
         self.assertIn(f"Already handled earlier, left alone: {sid('n1')}", output.splitlines())
-        self.assertIn(f"Skipped (system or security email): {sid('s1')}", output.splitlines())
+        self.assertIn("System or security emails skipped: 1", output.splitlines())
+        self.assertNotIn(sid("s1"), output)
         self.assertNotIn("Needs a person", output)
         self.assertEqual(outlook.where("s1"), "leads")
         self.assertEqual(len(gemini.calls), calls)
@@ -2108,7 +2109,8 @@ class LeadsToAttioTests(unittest.TestCase):
         self.assertEqual(outlook.where(message["id"]), "leads")
         self.assertEqual(outlook.changes(), [])
         self.assertFalse(self.state_path.exists())
-        self.assertIn(f"Skipped (system or security email): {outlook_triage.short_id(message)}", output)
+        self.assertNotIn("Skipped (system or security email)", output, "system emails are counted, never listed")
+        self.assertNotIn(outlook_triage.short_id(message), output)
         self.assertIn("System or security emails skipped: 1", output)
         self.assertNotIn("Needs a person", output)
         return output
@@ -2135,7 +2137,8 @@ class LeadsToAttioTests(unittest.TestCase):
         for _ in range(2):
             code, output = self.live(outlook, attio, gemini)
             self.assertEqual(code, 0)
-            self.assertIn(f"Skipped (system or security email): {sid('m1')}", output)
+            self.assertIn("System or security emails skipped: 1", output)
+            self.assertNotIn(sid("m1"), output)
         self.assertEqual(gemini.calls, [])
         self.assertFalse(self.state_path.exists())
 
@@ -2152,8 +2155,9 @@ class LeadsToAttioTests(unittest.TestCase):
                 attio = PretendAttio()
                 code, output = self.run_main(outlook, attio, gemini, argv)
                 self.assertEqual(code, 0)
-                self.assertIn(f"Skipped (system or security email): {sid('s1')}", output)
-                self.assertIn(f"Skipped (system or security email): {sid('s2')}", output)
+                self.assertNotIn("Skipped (system or security email)", output)
+                self.assertNotIn(sid("s1"), output)
+                self.assertNotIn(sid("s2"), output)
                 self.assertIn("System or security emails skipped: 2", output)
                 self.assertEqual(len(gemini.calls), 0)
                 self.assertNotIn(f"Email: {sid('s2')}", output)
@@ -2217,7 +2221,8 @@ class LeadsToAttioTests(unittest.TestCase):
         gemini, attio = PretendGemini(), PretendAttio()
         code, output = self.live(outlook, attio, gemini, "--only-subject", "invoice")
         self.assertEqual(code, 0)
-        self.assertIn(f"Skipped (system or security email): {sid('a')}", output)
+        self.assertNotIn("Skipped (system or security email)", output)
+        self.assertNotIn(sid("a"), output)
         self.assertNotIn(sid("b"), output)
         self.assertIn("System or security emails skipped: 1", output)
         self.assertEqual(gemini.calls, [])
@@ -2565,7 +2570,8 @@ class LeadsToAttioTests(unittest.TestCase):
         self.assertEqual(code, 0)
         lines = output.splitlines()
         self.assertIn(f"Already handled earlier, left alone: {outlook_triage.short_id(done)}", lines)
-        self.assertIn(f"Skipped (system or security email): {outlook_triage.short_id(system)}", lines)
+        self.assertIn("System or security emails skipped: 1", lines)
+        self.assertNotIn(outlook_triage.short_id(system), output)
         self.assertIn(f"Still needs a person: {outlook_triage.short_id(waiting)} ({leads_to_attio.NO_ANSWER})", lines)
         self.assert_nothing_private(output)
         code, output = self.live(outlook, attio, gemini, "--retry-attention")
@@ -2631,6 +2637,162 @@ class LeadsToAttioTests(unittest.TestCase):
         for line in text.splitlines():
             if ">>" in line:
                 self.assertTrue(line.startswith(("echo ===== %date% %time%", "echo exit code:", "%PY% workflows")), line)
+
+    # ==== Ready for GitHub Actions (tests/cases/17-actions-readiness.md) ===============================
+
+    def files_in_tmp(self):
+        return sorted(path.name for path in self.tmp.iterdir())
+
+    def test_s1_stateless_reads_and_writes_no_state_file(self):
+        self.state_path.write_text(json.dumps({"version": 1, "emails": {"m1": {"status": "done"}}}), encoding="utf-8")
+        before = self.state_path.read_bytes()
+        outlook, attio, gemini = self.one_lead()
+        code, output = self.live(outlook, attio, gemini, "--stateless")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.state_path.read_bytes(), before, "the state file must be left exactly as it was")
+        self.assertEqual(outlook.where("m1"), "processed", "the old record is not used, so the lead is handled")
+        self.assertEqual(attio.counts(), (1, 1, 1, 1))
+        self.assertNotIn("state file", output)
+
+    def test_s1_stateless_creates_no_file_not_even_a_temporary_one(self):
+        outlook, attio, gemini = self.one_lead()
+        code, _ = self.live(outlook, attio, gemini, "--stateless")
+        self.assertEqual(code, 0)
+        self.assertFalse(self.state_path.exists())
+        self.assertFalse(self.state_path.with_name(self.state_path.name + ".tmp").exists())
+        self.assertEqual(outlook.where("m1"), "processed")
+
+    def test_s1_without_the_switch_the_state_is_written_as_before(self):
+        outlook, attio, gemini = self.one_lead()
+        code, _ = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn("m1", self.state()["emails"])
+
+    def test_s1_a_dry_run_with_the_switch_changes_nothing(self):
+        outlook, attio, gemini = self.one_lead()
+        code, output = self.dry(outlook, attio, gemini, "--stateless")
+        self.assertEqual(code, 0)
+        self.assertEqual(attio.writes(), [])
+        self.assertEqual(outlook.changes(), [])
+        self.assertFalse(self.state_path.exists())
+
+    def test_s4_a_run_that_stopped_at_the_note_is_finished_by_a_new_run_with_no_state(self):
+        outlook, attio, gemini = self.one_lead()
+        attio.fail("POST", "/v2/notes", Status(503, "overloaded"))
+        code, _ = self.live(outlook, attio, gemini, "--stateless")
+        self.assertEqual(code, 1)
+        self.assertEqual(outlook.where("m1"), "leads")
+        self.assertEqual(attio.counts(), (1, 1, 1, 0))
+        code, output = self.live(outlook, attio, gemini, "--stateless")
+        self.assertEqual(code, 0)
+        self.assertEqual(attio.counts(), (1, 1, 1, 1), "nothing is made twice, and the note is added once")
+        self.assertEqual(outlook.where("m1"), "processed")
+        self.assertFalse(self.state_path.exists())
+
+    def test_s4_a_run_that_stopped_at_the_move_is_finished_by_a_new_run_with_no_state(self):
+        outlook, attio, gemini = self.one_lead()
+        outlook.move_errors = {1: http_error(500)}
+        code, _ = self.live(outlook, attio, gemini, "--stateless")
+        self.assertEqual(code, 1)
+        self.assertEqual(attio.counts(), (1, 1, 1, 1))
+        self.assertEqual(outlook.where("m1"), "leads")
+        code, output = self.live(outlook, attio, gemini, "--stateless")
+        self.assertEqual(code, 0)
+        self.assertEqual(attio.counts(), (1, 1, 1, 1), "no second person, company, deal or note")
+        self.assertEqual(outlook.where("m1"), "processed")
+
+    def test_s4_two_emails_from_one_person_still_make_one_deal_and_two_notes_with_no_state(self):
+        outlook = PretendOutlook(leads=[
+            lead_msg("a1", "First enquiry", received="2026-10-20T07:00:00Z"),
+            lead_msg("a2", "Second enquiry", received="2026-10-20T08:00:00Z"),
+        ])
+        gemini = PretendGemini({"First enquiry": info(), "Second enquiry": info()})
+        attio = PretendAttio()
+        for _ in range(2):
+            code, _ = self.live(outlook, attio, gemini, "--stateless")
+            self.assertEqual(code, 0)
+        self.assertEqual(attio.counts(), (1, 1, 1, 2))
+        self.assertEqual([outlook.where("a1"), outlook.where("a2")], ["processed", "processed"])
+
+    def test_s4_leads_that_need_a_person_are_counted_not_listed(self):
+        outlook = PretendOutlook(leads=[
+            lead_msg("n1", "Nothing saved one", received="2026-10-20T07:00:00Z"),
+            lead_msg("n2", "Nothing saved two", received="2026-10-20T08:00:00Z"),
+            lead_msg("g1", "A good enquiry", received="2026-10-20T09:00:00Z"),
+        ])
+        gemini = PretendGemini({"A good enquiry": info()})        # nothing is saved on n1 and n2
+        attio = PretendAttio()
+        for run in (1, 2):
+            with self.subTest(run=run):
+                code, output = self.live(outlook, attio, gemini, "--stateless")
+                self.assertEqual(code, 0)
+                lines = output.splitlines()
+                self.assertIn("Needs a person: 2", lines)
+                self.assertIn("Left in Leads: 2", lines)
+                self.assertNotIn("Needs a person to look at it", output)
+                self.assertNotIn("Still needs a person", output)
+                self.assertNotIn(sid("n1"), output)
+                self.assertNotIn(sid("n2"), output)
+        self.assertFalse(self.state_path.exists())
+        self.assertEqual([outlook.where("n1"), outlook.where("n2")], ["leads", "leads"])
+        self.assertEqual(attio.counts(), (1, 1, 1, 1), "only the good enquiry was handled")
+
+    def test_s4_leads_that_need_a_person_do_not_use_up_the_maximum_when_stateless(self):
+        # Without state they are looked at again on every run, so they must never crowd out the good leads behind them.
+        stuck = [lead_msg(f"n{i}", f"Nothing saved {i}", received=f"2026-10-20T0{i}:00:00Z") for i in range(3)]
+        good = [lead_msg(f"g{i}", f"Good enquiry {i}", sender=f"p{i}@co{i}.example", name=f"P{i}",
+                         received=f"2026-10-20T1{i}:00:00Z") for i in range(3)]
+        outlook = PretendOutlook(leads=stuck + good)
+        gemini = PretendGemini({f"Good enquiry {i}": info(name=f"P{i}", email=f"p{i}@co{i}.example", company=f"Co{i}")
+                                for i in range(3)})
+        attio = PretendAttio()
+        with mock.patch.object(leads_to_attio, "MAX_PER_RUN", 2):
+            code, output = self.live(outlook, attio, gemini, "--stateless")
+            self.assertEqual(code, 0)
+            self.assertEqual([outlook.where(f"g{i}") for i in range(3)], ["processed", "processed", "leads"])
+            self.assertEqual([outlook.where(f"n{i}") for i in range(3)], ["leads", "leads", "leads"])
+            self.assertIn("Needs a person: 3", output.splitlines())
+            self.assertIn("1 still waiting for the next run.", output)
+            code, output = self.live(outlook, attio, gemini, "--stateless")
+            self.assertEqual(code, 0)
+        self.assertEqual([outlook.where(f"g{i}") for i in range(3)], ["processed"] * 3)
+        self.assertEqual(attio.counts(), (3, 3, 3, 3))
+
+    def test_s4_with_state_the_maximum_still_counts_every_email_taken_from_the_list(self):
+        stuck = [lead_msg(f"n{i}", f"Nothing saved {i}", received=f"2026-10-20T0{i}:00:00Z") for i in range(3)]
+        good = lead_msg("g0", "Good enquiry", sender="p0@co0.example", name="P0", received="2026-10-20T10:00:00Z")
+        outlook = PretendOutlook(leads=stuck + [good])
+        gemini = PretendGemini({"Good enquiry": info(name="P0", email="p0@co0.example", company="Co0")})
+        attio = PretendAttio()
+        with mock.patch.object(leads_to_attio, "MAX_PER_RUN", 2):
+            code, output = self.live(outlook, attio, gemini)
+            self.assertEqual(code, 0)
+            self.assertIn("2 still waiting for the next run.", output)      # as before: 2 taken, 2 left
+            self.assertEqual(outlook.where("g0"), "leads")
+            code, output = self.live(outlook, attio, gemini)                # n0 and n1 are remembered now
+            self.assertEqual(outlook.where("g0"), "processed")
+
+    def test_s4_without_the_switch_the_needs_a_person_lines_are_unchanged(self):
+        outlook, attio, gemini = self.one_lead()
+        outlook.extensions.clear()
+        gemini.replies = {}
+        code, output = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn(f"  Needs a person to look at it: {sid('m1')} ({leads_to_attio.NO_ANSWER})", output.splitlines())
+        self.assertNotIn("Needs a person: 1", output.splitlines())
+
+    def test_s4_a_failure_says_which_email_was_being_handled_by_id(self):
+        outlook, attio, gemini = self.private_world()
+        short = outlook_triage.short_id(outlook.leads["p1"])
+        attio.fail("POST", "/v2/notes", Status(403, "forbidden"))
+        for argv in (["--live"], ["--live", "--stateless"]):
+            with self.subTest(argv=argv):
+                outlook, attio, gemini = self.private_world()
+                attio.fail("POST", "/v2/notes", Status(403, "forbidden"))
+                code, output = self.run_main(outlook, attio, gemini, argv)
+                self.assertEqual(code, 1)
+                self.assertIn(f"The email being handled was {short}.", output.splitlines())
+                self.assert_nothing_private(output)
 
 
 if __name__ == "__main__":

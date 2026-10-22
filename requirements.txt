@@ -1,0 +1,11 @@
+# Pinned libraries for the Nova Wellness pipeline (see tests/cases/17-actions-readiness.md)
+certifi==2026.10.18
+cffi==2.1.1
+charset-normalizer==3.5.2
+cryptography==50.0.2
+idna==3.20
+msal==1.39.0
+pycparser==3.11
+PyJWT==2.15.1
+requests==2.34.2
+urllib3==2.8.0

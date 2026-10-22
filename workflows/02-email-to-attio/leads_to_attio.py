@@ -27,6 +27,13 @@ technical progress (ids, status, a short reference), never a lead's details.
 It never deletes anything and never sends, replies to, forwards or copies an email. The only change
 it asks Outlook for is moving a handled email to Leads/Processed.
 
+With --stateless it keeps no state file at all: nothing is read or written, and Attio and the mailbox are the memory.
+That is safe because every step looks before it creates (the person by email address, the company by domain, the
+person's deal at stage New) and a note carries a reference to its email, so an email that is still in Leads after a
+stopped run is simply finished by the next one without making anything twice. Leads whose saved answer cannot be used
+are counted ("Needs a person: N"), not listed, and never crowd out the good leads behind them. This is how it runs on
+GitHub Actions, where each run starts on a fresh machine. System and security emails are only counted, never listed.
+
 Run:  python workflows\\02-email-to-attio\\leads_to_attio.py
       python workflows\\02-email-to-attio\\leads_to_attio.py --live
       python workflows\\02-email-to-attio\\leads_to_attio.py --live --only-subject "ATTIO-TEST"
@@ -64,6 +71,7 @@ from outlook_triage import (  # noqa: E402
 )
 
 STATE_PATH = HERE / "leads-to-attio-state.json"
+STATELESS = False       # set by each run from --stateless: no state file is read or written
 ATTIO_BASE = "https://api.attio.com"
 ATTIO_TIMEOUT_SECONDS = 30
 RETRY_WAIT_SECONDS = 2
@@ -378,7 +386,12 @@ def fresh_state():
 
 
 def load_state(live):
-    """Returns (state, note). A damaged file is set aside (live) and a fresh start is made."""
+    """Returns (state, note). A damaged file is set aside (live) and a fresh start is made.
+
+    With --stateless no file is read at all: the run starts empty and says nothing about it.
+    """
+    if STATELESS:
+        return fresh_state(), None
     if not STATE_PATH.exists():
         return fresh_state(), None
     try:
@@ -401,6 +414,8 @@ def load_state(live):
 
 
 def save_state(state):
+    if STATELESS:
+        return
     temp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
     temp.write_text(json.dumps(state, indent=2), encoding="utf-8")
     os.replace(temp, STATE_PATH)
@@ -665,7 +680,9 @@ def check_settings():
     return attio_key, owner
 
 
-def run(live, only_subject, only_from=None, retry_attention=False):
+def run(live, only_subject, only_from=None, retry_attention=False, stateless=False):
+    global STATELESS
+    STATELESS = bool(stateless)       # set on every run, so one run never leaks its setting into the next
     if only_subject is not None and not only_subject.strip():
         raise AttioProblem(
             "The --only-subject text must not be empty, because empty text would match every email."
@@ -727,10 +744,7 @@ def run(live, only_subject, only_from=None, retry_attention=False):
         else:
             waiting_list.append(message)
 
-    # System and security emails are reported and left completely untouched in Leads.
-    for message in system:
-        say(f"Skipped (system or security email): {short_id(message)}")
-
+    # System and security emails are left completely untouched in Leads, and only counted below.
     if not waiting_list:
         if (needle is not None or wanted_from is not None) and not left and not system:
             # The filter text is never echoed back: it could be a subject or a sender.
@@ -746,24 +760,38 @@ def run(live, only_subject, only_from=None, retry_attention=False):
         say(f"System or security emails skipped: {len(system)}")
         return 0
 
-    waiting = max(0, len(waiting_list) - MAX_PER_RUN)
-    batch = waiting_list[:MAX_PER_RUN]
     worker = Worker(client, token, owner_id, stage, processed_id, state, live)
     handled = 0
+    taken = 0               # emails taken from the list so far
+    needs_person = 0        # (with --stateless) leads whose saved answer cannot be used, counted and not listed
+    current = None
     try:
-        for message in batch:
-            say(f"Email: {short_id(message)}")
+        for message in waiting_list:
+            # With state, every email taken counts against the maximum (an unusable one is then remembered and
+            # skipped from the next run on). Without state it would be looked at again on every run, so only the
+            # leads actually handled count: a few unusable ones can never crowd out the good leads behind them.
+            if (handled if STATELESS else taken) >= MAX_PER_RUN:
+                break
+            taken += 1
+            current = short_id(message)
+            if not STATELESS:
+                say(f"Email: {current}")
             message_id = message["id"]
             entry = state["emails"].get(message_id) or {}
             # The saved answer is read from the email every time; it is never copied into the state file.
             lead, reason = lead_of(token, message_id)
             if lead is None:
-                say(f"  Needs a person to look at it: {short_id(message)} ({reason})")
+                if STATELESS:
+                    needs_person += 1       # a line per email would repeat in the log on every run
+                else:
+                    say(f"  Needs a person to look at it: {current} ({reason})")
                 if live:
                     state["emails"][message_id] = {"status": "attention", "reason": reason}
                     save_state(state)
                 left += 1
                 continue
+            if STATELESS:
+                say(f"Email: {current}")
             if entry.get("status") == "in_progress":
                 entry["ref"] = entry.get("ref") or email_reference(message_id)     # carry on where it stopped
             else:
@@ -777,9 +805,12 @@ def run(live, only_subject, only_from=None, retry_attention=False):
             handled += 1
     except PROBLEMS as problem:
         say(str(problem))
+        if current:
+            say(f"The email being handled was {current}.")
         say(f"Stopped. {handled} lead(s) were finished before this. The email being handled stays in Leads.")
         return 1
 
+    waiting = len(waiting_list) - taken
     counts = worker.counts
     say()
     if live:
@@ -795,6 +826,8 @@ def run(live, only_subject, only_from=None, retry_attention=False):
         say(f"Deals that would be created: {counts['deals']}")
         say(f"Notes that would be added to existing deals: {counts['notes_existing']}")
     say(f"System or security emails skipped: {len(system)}")
+    if STATELESS:
+        say(f"Needs a person: {needs_person}")
     say(f"Left in Leads: {left}")
     if waiting:
         say(f"{waiting} still waiting for the next run.")
@@ -810,18 +843,18 @@ def main():
                         help="only handle emails from exactly this sender address (use with --only-subject to narrow further)")
     parser.add_argument("--retry-attention", action="store_true",
                         help="read the saved answer again for emails marked as needing a person")
+    parser.add_argument("--stateless", action="store_true",
+                        help="keep no state file at all: Attio and the mailbox are the memory (for GitHub Actions)")
     args = parser.parse_args()
     try:
-        return run(args.live, args.only_subject, args.only_from, args.retry_attention)
+        return run(args.live, args.only_subject, args.only_from, args.retry_attention, args.stateless)
     except PROBLEMS as problem:
         print(problem)
         return 1
     except Exception as unexpected:
         # Only the kind of error is shown, in case details contain secrets.
-        print(
-            f"Something unexpected went wrong ({type(unexpected).__name__}). "
-            "The state file shows which emails were already handled."
-        )
+        memory = "Attio and the mailbox show" if STATELESS else "The state file shows"
+        print(f"Something unexpected went wrong ({type(unexpected).__name__}). {memory} which emails were already handled.")
         return 1
 
 
