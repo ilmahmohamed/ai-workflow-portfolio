@@ -1,0 +1,105 @@
+name: Nova Wellness pipeline
+
+# Triage new Outlook emails, then sync leads to Attio. Scheduled and live runs do nothing until the repo
+# variable PIPELINE_ENABLED is "true". A manual dry run is allowed any time (it is read-only).
+# Every value comes from the repo's Actions secrets, none is written here.
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # the pipeline, every 15 minutes
+    - cron: '7 8 * * *'      # the daily "alive" message (08:07 UTC, never at the same time as the pipeline)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Dry run only reads and reports. Live really changes Outlook, Slack and Attio.
+        type: choice
+        options:
+          - dry-run
+          - live
+        default: dry-run
+
+permissions:
+  contents: read
+
+jobs:
+  pipeline:
+    # Needs the switch, except a manual dry run: that only reads and reports, so it may run while the switch is off.
+    if: (vars.PIPELINE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'dry-run')) && github.event.schedule != '7 8 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # One run at a time. A run that arrives while another is going waits its turn.
+    concurrency:
+      group: pipeline
+      cancel-in-progress: false
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUNBUFFERED: '1'
+      # Scheduled runs are always live. A manual run is live only if you pick "live".
+      LIVE: ${{ (github.event_name == 'schedule' || inputs.mode == 'live') && '--live' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install libraries
+        id: install
+        shell: bash
+        run: |
+          pip install -r requirements.txt
+
+      # Both steps pass their output through the log filter, which blanks anything shaped like an
+      # address. The mailbox is the only memory (--stateless), so no file is kept between runs.
+      - name: Triage
+        id: triage
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+          MS_TOKEN_CACHE: ${{ secrets.MS_TOKEN_CACHE }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python workflows/02-email-to-attio/outlook_triage.py $LIVE --slack live --drafts on --stateless 2>&1 | python workflows/02-email-to-attio/log_filter.py
+
+      - name: Attio sync
+        id: attio
+        shell: bash
+        env:
+          MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+          MS_TOKEN_CACHE: ${{ secrets.MS_TOKEN_CACHE }}
+          ATTIO_API_KEY: ${{ secrets.ATTIO_API_KEY }}
+          ATTIO_DEAL_OWNER: ${{ secrets.ATTIO_DEAL_OWNER }}
+        run: |
+          python workflows/02-email-to-attio/leads_to_attio.py $LIVE --stateless 2>&1 | python workflows/02-email-to-attio/log_filter.py
+
+      # If anything above failed: say which step, with a link to the run. Nothing else is sent.
+      # Live runs only: a dry run posts nothing anywhere (its result is on the run page).
+      - name: Alert in #automation-log
+        if: failure() && env.LIVE != ''
+        shell: bash
+        env:
+          SLACK_LOG_WEBHOOK_URL: ${{ secrets.SLACK_LOG_WEBHOOK_URL }}
+          INSTALL: ${{ steps.install.outcome }}
+          TRIAGE: ${{ steps.triage.outcome }}
+          ATTIO: ${{ steps.attio.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          STEP="set-up (checkout or Python)"
+          if [ "$INSTALL" = failure ]; then STEP="Install libraries"; fi
+          if [ "$TRIAGE" = failure ]; then STEP="Triage"; fi
+          if [ "$ATTIO" = failure ]; then STEP="Attio sync"; fi
+          curl -sS --fail --max-time 20 -o /dev/null -X POST -H 'Content-Type: application/json' --data "{\"text\":\"Pipeline step failed: $STEP. Run: $RUN_URL\"}" "$SLACK_LOG_WEBHOOK_URL" || echo "The alert could not be posted."
+
+  # Once a day: proof that the schedule is still running. No concurrency group, so it can never
+  # push a waiting pipeline run out of the queue.
+  alive:
+    if: vars.PIPELINE_ENABLED == 'true' && github.event.schedule == '7 8 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Post "pipeline alive" in #automation-log
+        shell: bash
+        env:
+          SLACK_LOG_WEBHOOK_URL: ${{ secrets.SLACK_LOG_WEBHOOK_URL }}
+        run: |
+          curl -sS --fail --max-time 20 -o /dev/null -X POST -H 'Content-Type: application/json' --data "{\"text\":\"Pipeline alive ($(date -u +%F))\"}" "$SLACK_LOG_WEBHOOK_URL"
