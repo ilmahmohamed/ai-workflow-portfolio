@@ -2517,10 +2517,41 @@ class TriageTests(unittest.TestCase):
         # The batch file only adds the run's printed lines to the log (plus a time and an exit code),
         # so the log is as private as the output.
         text = (PROJECT_ROOT / "workflows" / "02-email-to-attio" / "run_triage.bat").read_text(encoding="utf-8")
-        self.assertIn("outlook_triage.py --live >> \"%LOG%\" 2>&1", text)
+        self.assertIn("outlook_triage.py --live --slack live --drafts on >> \"%LOG%\" 2>&1", text)
         for line in text.splitlines():
             if ">>" in line:
                 self.assertTrue(line.startswith(("echo ===== %date% %time%", "echo exit code:", "%PY% workflows")), line)
+
+    def scheduler_commands(self, name):
+        """The python command lines (the ones that run a script) of a scheduler batch file."""
+        text = (PROJECT_ROOT / "workflows" / "02-email-to-attio" / name).read_text(encoding="utf-8")
+        return [line.strip() for line in text.splitlines() if line.strip().startswith("%PY% workflows")
+                and ("outlook_triage.py" in line or "leads_to_attio.py" in line)]
+
+    def test_p11_the_scheduled_triage_runs_live_with_slack_live_and_drafts_on(self):
+        (command,) = self.scheduler_commands("run_triage.bat")
+        self.assertEqual(command, '%PY% workflows\\02-email-to-attio\\outlook_triage.py --live --slack live '
+                                  '--drafts on >> "%LOG%" 2>&1')
+        for word in ("--slack test", "--slack off", "--drafts off", "--only-subject", "--prompt"):
+            self.assertNotIn(word, command, "the scheduled run uses the real channel and the default prompt, for every email")
+
+    def test_p11_the_scheduled_attio_step_runs_live_for_every_lead(self):
+        (command,) = self.scheduler_commands("run_leads_to_attio.bat")
+        self.assertEqual(command, '%PY% workflows\\02-email-to-attio\\leads_to_attio.py --live >> "%LOG%" 2>&1')
+        for word in ("--only-subject", "--only-from", "--retry-attention"):
+            self.assertNotIn(word, command)
+
+    def test_p11_both_scheduler_files_run_the_scripts_of_this_project_and_keep_the_log_short(self):
+        for name, log in (("run_triage.bat", "triage-log.txt"), ("run_leads_to_attio.bat", "leads-to-attio-log.txt")):
+            with self.subTest(name=name):
+                text = (PROJECT_ROOT / "workflows" / "02-email-to-attio" / name).read_text(encoding="utf-8")
+                self.assertIn('cd /d "%~dp0..\\.."', text, "it starts from the project folder, found from its own location")
+                self.assertIn(f"set LOG=%~dp0{log}", text)
+                self.assertIn("trim_log.py", text)
+                self.assertIsNone(re.search(r"[A-Za-z]:\\", text),
+                                  "no full path (drive letter, user or folder name) is written in the file")
+                self.assertNotIn("/Users/", text)
+                self.assertNotIn("/home/", text)
 
     # ==== Ready for GitHub Actions (tests/cases/17-actions-readiness.md) ===============================
 
