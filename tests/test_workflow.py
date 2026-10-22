@@ -82,6 +82,12 @@ class WorkflowTests(unittest.TestCase):
             with self.subTest(job=name):
                 self.assertRegex(body, r"timeout-minutes: \d+")
 
+    def test_the_pipeline_job_outlasts_the_worst_case_of_gemini_failing(self):
+        # Three emails in a row, each: a 120 s request, a 10 s wait, a 120 s retry = 12.5 minutes, plus set-up and Attio.
+        limit = int(re.search(r"timeout-minutes: (\d+)", jobs()["pipeline"]).group(1))
+        self.assertGreaterEqual(limit, 20)
+        self.assertLessEqual(limit, 30, "a stuck run must not block the queue for long")
+
     def test_the_workflow_can_only_read_the_repo(self):
         self.assertRegex(text(), re.compile(r"^permissions:\s*\n  contents: read\s*$", re.MULTILINE))
 

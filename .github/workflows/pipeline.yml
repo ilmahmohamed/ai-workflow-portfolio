@@ -26,7 +26,7 @@ jobs:
     # Needs the switch, except a manual dry run: that only reads and reports, so it may run while the switch is off.
     if: (vars.PIPELINE_ENABLED == 'true' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'dry-run')) && github.event.schedule != '7 8 * * *'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20      # room for Gemini's longer timeout and its one retry on a few emails
     # One run at a time. A run that arrives while another is going waits its turn.
     concurrency:
       group: pipeline

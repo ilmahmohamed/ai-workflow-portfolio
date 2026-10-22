@@ -45,10 +45,10 @@ EXPECTED_PATH = PROJECT_ROOT / "tests" / "cases" / "expected-results.json"
 
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 KEY_NAME = "GEMINI_API_KEY"
-REQUEST_TIMEOUT = 60
+REQUEST_TIMEOUT = 120      # seconds Gemini gets to answer one request (60 was too short on GitHub Actions)
 PAUSE_SECONDS = 6          # between emails, to stay inside the free per-minute limit
 RETRY_WAIT_SECONDS = 30    # wait before the one retry after "too many requests"
-BUSY_WAIT_SECONDS = 10     # wait before the one retry after a temporary 503 ("busy")
+BUSY_WAIT_SECONDS = 10     # wait before the one retry after a temporary 503, a timeout or a lost connection
 SAMPLE_NOTE = f"up to {v3_reply.SAMPLE_LIMIT}, spread across the leads"
 GENERATION_SEED = 42       # a fixed seed, to keep answers as repeatable as the API allows
 _seed_rejected = False     # set for the rest of the run if Gemini does not accept the seed setting
@@ -59,6 +59,18 @@ LEAD_FIELDS = ["name", "email", "company", "role", "request_type", "urgency"]
 
 class SetupProblem(Exception):
     """A problem we can explain to the user in plain words."""
+
+
+class GeminiUnreachable(SetupProblem):
+    """Gemini could not be reached, or answered with a server error, even after any retry.
+
+    The key and the model are fine, so a caller that handles many emails may leave this one alone and carry on.
+    Every other SetupProblem (a rejected key, an unknown model, the free limit) is a reason to stop at once.
+    """
+
+
+class GeminiNoAnswer(GeminiUnreachable):
+    """No answer came back at all (a timeout or a lost connection): worth one retry."""
 
 
 # ---- Settings ---------------------------------------------------------------
@@ -164,13 +176,14 @@ def count_emails(number):
 
 # ---- Talking to Gemini ------------------------------------------------------
 
-def unreachable(reason):
+def unreachable(reason, no_answer=False):
     """The plain message for "couldn't reach Gemini", with a safe hint about why.
 
     The reason is always one of our own short phrases or a status number, never
     the error text from the failure, so it can't contain a key or email text.
     """
-    return SetupProblem(
+    kind = GeminiNoAnswer if no_answer else GeminiUnreachable
+    return kind(
         f"I couldn't reach the AI service ({reason}). Check your internet and try again."
     )
 
@@ -196,11 +209,11 @@ def send_request(model, key, message):
             timeout=REQUEST_TIMEOUT,
         )
     except requests.exceptions.Timeout:
-        raise unreachable("the request timed out")
+        raise unreachable("the request timed out", no_answer=True)
     except requests.exceptions.ConnectionError:
-        raise unreachable("no connection")
+        raise unreachable("no connection", no_answer=True)
     except requests.exceptions.RequestException:
-        raise unreachable("a connection problem")
+        raise unreachable("a connection problem", no_answer=True)
 
 
 def call_once(model, key, message):
@@ -243,15 +256,17 @@ class ServiceBusy(Exception):
 
 
 def ask_gemini(model, key, message):
-    """Ask once; if the free limit is hit or Gemini is busy (503), wait and try one more time.
+    """Ask once; if the free limit is hit, Gemini is busy (503) or no answer comes back (a timeout or a lost
+    connection), wait and try one more time.
 
-    There is only one retry in total, whichever of the two problems came first.
+    There is only one retry in total, whichever problem came first. A rejected key, an unknown model and other
+    server errors (500, 502, 504) are not retried.
     """
     try:
         return call_once(model, key, message)
     except RateLimited:
         time.sleep(RETRY_WAIT_SECONDS)
-    except ServiceBusy:
+    except (ServiceBusy, GeminiNoAnswer):
         time.sleep(BUSY_WAIT_SECONDS)
     try:
         return call_once(model, key, message)

@@ -483,7 +483,7 @@ class ExtractionTests(unittest.TestCase):
         world = PretendGemini({JONAS_MARKER: Raise(requests.exceptions.ConnectionError("down"))})
         self.run_main(world, ["--live"])
         self.assertFalse(self.accuracy_path.exists())
-        self.assertEqual(len(world.calls), 1, "it should stop straight away")
+        self.assertEqual(len(world.calls), 2, "one try plus one retry, then it stops")
 
     def test_case5_a_timeout_is_treated_the_same_way(self):
         world = PretendGemini({JONAS_MARKER: Raise(requests.exceptions.Timeout("slow"))})
@@ -1264,6 +1264,87 @@ class ExtractionTests(unittest.TestCase):
         world = PretendGemini(good_replies())
         code, _ = self.run_main(world, ["--live"])
         self.assertEqual(code, 0)
+
+
+class AskGeminiRetryTests(unittest.TestCase):
+    """ask_gemini on its own: a longer wait for each request, and exactly one retry in total."""
+
+    class Answer:
+        def __init__(self, code, text=""):
+            self.status_code = code
+            self.text = text or "error"
+            self._text = text
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": self._text}]}}]}
+
+    def ask(self, *replies):
+        """Run ask_gemini against pretend replies (an Answer, or an exception to raise). Returns (result, calls, sleeps)."""
+        sleeps = []
+        post = mock.Mock(side_effect=list(replies))
+        with mock.patch.object(extract_leads.requests, "post", post), mock.patch("time.sleep", sleeps.append), \
+                mock.patch.object(extract_leads, "_seed_rejected", True):
+            try:
+                result = extract_leads.ask_gemini("fake-model", FAKE_KEY, "an email")
+            except Exception as problem:
+                result = problem
+        return result, post, sleeps
+
+    def good(self):
+        return self.Answer(200, '{"category": "Not a lead"}')
+
+    def test_each_request_may_take_up_to_two_minutes(self):
+        self.assertEqual(extract_leads.REQUEST_TIMEOUT, 120)
+        _, post, _ = self.ask(self.good())
+        self.assertEqual(post.call_args.kwargs["timeout"], extract_leads.REQUEST_TIMEOUT)
+
+    def test_a_timeout_is_retried_once_after_a_short_wait(self):
+        result, post, sleeps = self.ask(requests.exceptions.Timeout("slow"), self.good())
+        self.assertEqual(result, '{"category": "Not a lead"}')
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(sleeps, [extract_leads.BUSY_WAIT_SECONDS])
+
+    def test_a_dropped_connection_is_retried_once(self):
+        result, post, _ = self.ask(requests.exceptions.ConnectionError("down"), self.good())
+        self.assertEqual(result, '{"category": "Not a lead"}')
+        self.assertEqual(post.call_count, 2)
+
+    def test_a_server_error_other_than_503_is_still_not_retried_but_can_be_skipped(self):
+        for code in (500, 502, 504):
+            with self.subTest(code=code):
+                result, post, _ = self.ask(self.Answer(code), self.good())
+                self.assertIsInstance(result, extract_leads.GeminiUnreachable)
+                self.assertEqual(post.call_count, 1)
+
+    def test_two_timeouts_give_up_after_exactly_two_requests_with_an_unreachable_error(self):
+        result, post, _ = self.ask(requests.exceptions.Timeout("slow"), requests.exceptions.Timeout("slow"), self.good())
+        self.assertIsInstance(result, extract_leads.GeminiUnreachable)
+        self.assertIsInstance(result, extract_leads.SetupProblem)
+        self.assertIn("(the request timed out)", str(result))
+        self.assertEqual(post.call_count, 2)
+
+    def test_there_is_only_one_retry_in_total_whichever_problem_comes_first(self):
+        result, post, _ = self.ask(self.Answer(429), requests.exceptions.Timeout("slow"), self.good())
+        self.assertIsInstance(result, extract_leads.GeminiUnreachable)
+        self.assertEqual(post.call_count, 2)
+        result, post, _ = self.ask(requests.exceptions.Timeout("slow"), self.Answer(429), self.good())
+        self.assertNotIsInstance(result, extract_leads.GeminiUnreachable)    # the free limit: a stop, not a skip
+        self.assertIn("free limit", str(result))
+        self.assertEqual(post.call_count, 2)
+
+    def test_a_rejected_key_or_unknown_model_is_not_retried_and_is_not_an_unreachable_error(self):
+        for code in (401, 403, 404, 400):
+            with self.subTest(code=code):
+                result, post, _ = self.ask(self.Answer(code), self.good())
+                self.assertIsInstance(result, extract_leads.SetupProblem)
+                self.assertNotIsInstance(result, extract_leads.GeminiUnreachable)
+                self.assertEqual(post.call_count, 1)
+
+    def test_the_error_text_still_never_holds_anything_from_the_failure(self):
+        leaky = requests.exceptions.ConnectionError(f"failed for {FAKE_KEY} Blue Reed Yoga")
+        result, _, _ = self.ask(leaky, leaky)
+        self.assertNotIn(FAKE_KEY, str(result))
+        self.assertNotIn("Blue Reed Yoga", str(result))
 
 
 if __name__ == "__main__":

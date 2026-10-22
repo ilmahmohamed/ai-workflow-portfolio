@@ -877,7 +877,7 @@ class TriageTests(unittest.TestCase):
 
     # ---- Case 15: Gemini is down ------------------------------------------------------------------------------------
 
-    def test_case15_gemini_unreachable_stops_and_leaves_the_email_alone(self):
+    def test_case15_gemini_unreachable_leaves_that_email_alone_and_fails_the_run(self):
         outlook = PretendOutlook(
             [msg("m1", "First one", received="2026-10-20T08:00:00Z"),
              msg("m2", "Second one", received="2026-10-20T09:00:00Z")]
@@ -893,6 +893,132 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(outlook.categories("m2"), [])
         self.assertNotIn("m2", self.state()["emails"])
         self.assertIn("m1", self.state()["emails"])
+
+    # ---- Case 15b: one Gemini failure does not stop the other emails ----------------------------------------------------
+
+    FAILING_TWICE = Raise(requests.exceptions.Timeout("slow"))
+
+    def two_emails(self, first_reply, second_reply=NOT_LEAD):
+        outlook = PretendOutlook(
+            [msg("m1", "First one", received="2026-10-20T08:00:00Z"),
+             msg("m2", "Second one", received="2026-10-20T09:00:00Z")]
+        )
+        return outlook, PretendGemini({"First one": first_reply, "Second one": second_reply})
+
+    def asked(self, gemini, word):
+        return len([t for t in gemini.asked_about() if word in t])
+
+    def test_case15b_the_timeout_is_longer_and_the_limit_in_a_row_is_three(self):
+        self.assertEqual(extract_leads.REQUEST_TIMEOUT, 120)
+        self.assertEqual(outlook_triage.MAX_FAILURES_IN_A_ROW, 3)
+
+    def test_case15b_one_timeout_is_retried_and_the_email_is_then_handled_normally(self):
+        outlook, gemini = self.two_emails([Raise(requests.exceptions.Timeout("slow")), NOT_LEAD])
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.asked(gemini, "First one"), 2)
+        self.assertIn(extract_leads.BUSY_WAIT_SECONDS, self.sleeps)
+        self.assertIn("m1", self.state()["emails"])
+        self.assertNotIn("Failed", output)
+
+    def test_case15b_an_email_that_still_fails_is_left_untouched_and_the_next_one_is_handled(self):
+        outlook, gemini = self.two_emails(self.FAILING_TWICE)
+        short = outlook_triage.short_id(outlook.inbox["m1"])
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 1, "the step must still fail, once, so the alert goes out")
+        self.assertEqual(self.asked(gemini, "First one"), 2, "one try plus one retry")
+        self.assertEqual(self.asked(gemini, "Second one"), 1)
+        self.assertEqual(outlook.where("m1"), "inbox")
+        self.assertEqual(outlook.categories("m1"), [])
+        self.assertNotIn("m1", self.state()["emails"])
+        self.assertIn("m2", self.state()["emails"])
+        self.assertEqual(outlook.patches, [("m2", {"categories": ["Not a lead"]})])
+        self.assertIn(f"{short}: left untouched in the Inbox.", output.splitlines())
+
+    def test_case15b_the_failure_is_reported_at_the_end(self):
+        outlook, gemini = self.two_emails(self.FAILING_TWICE)
+        _, output = self.live(outlook, gemini)
+        lines = output.splitlines()
+        report = [i for i, line in enumerate(lines) if line.startswith("Failed (left untouched")]
+        self.assertEqual(len(report), 1)
+        self.assertTrue(lines[report[0]].endswith(": 1"))
+        self.assertGreater(report[0], lines.index("Done: 1 email(s) handled."))
+
+    def test_case15b_a_failed_email_is_tried_again_by_the_next_run(self):
+        outlook, gemini = self.two_emails(self.FAILING_TWICE)
+        self.live(outlook, gemini)
+        gemini = PretendGemini({"First one": NOT_LEAD, "Second one": NOT_LEAD})
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.asked(gemini, "First one"), 1)
+        self.assertEqual(self.asked(gemini, "Second one"), 0, "already handled")
+        self.assertIn("m1", self.state()["emails"])
+
+    def test_case15b_it_works_the_same_with_no_state_file(self):
+        outlook, gemini = self.two_emails(self.FAILING_TWICE)
+        code, _ = self.live(outlook, gemini, "--stateless")
+        self.assertEqual(code, 1)
+        self.assertEqual(outlook.categories("m1"), [])
+        self.assertEqual(outlook.categories("m2"), ["Not a lead"])
+        self.assertFalse(self.state_path.exists())
+
+    def test_case15b_failures_that_are_not_in_a_row_do_not_stop_the_run(self):
+        names = ["One", "Two", "Three", "Four", "Five"]
+        outlook = PretendOutlook([msg(f"m{i}", f"Email {n}", received=f"2026-10-20T0{i}:00:00Z")
+                                  for i, n in enumerate(names, 1)])
+        gemini = PretendGemini({f"Email {n}": (self.FAILING_TWICE if i % 2 else NOT_LEAD)
+                                for i, n in enumerate(names, 1)})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(gemini.asked_about()), 3 * 2 + 2, "three emails try twice, two are answered")
+        self.assertNotIn("kept failing", output)
+        self.assertEqual(sorted(self.state()["emails"]), ["m2", "m4"])
+        self.assertTrue(output.splitlines()[-1].startswith("Failed (left untouched") or "Failed (left untouched" in output)
+
+    def test_case15b_three_failures_in_a_row_stop_the_run_and_leave_the_rest_untouched(self):
+        names = ["One", "Two", "Three", "Four", "Five"]
+        outlook = PretendOutlook([msg(f"m{i}", f"Email {n}", received=f"2026-10-20T0{i}:00:00Z")
+                                  for i, n in enumerate(names, 1)])
+        gemini = PretendGemini({f"Email {n}": self.FAILING_TWICE for n in names})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(gemini.asked_about()), 3 * 2, "it gives up after the third email")
+        self.assertIn("The AI service kept failing, so I stopped.", output)
+        self.assertEqual(outlook.changes(), [])
+        self.assertFalse(self.state_path.exists())
+
+    def test_case15b_the_free_limit_still_stops_the_whole_run_at_once(self):
+        outlook, gemini = self.two_emails(Status(429, "slow down"))
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 1)
+        self.assertIn("free limit", output)
+        self.assertEqual(self.asked(gemini, "Second one"), 0)
+        self.assertEqual(outlook.changes(), [])
+
+    def test_case15b_a_rejected_key_still_stops_the_whole_run_at_once(self):
+        outlook, gemini = self.two_emails(Status(401, "bad key"))
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(gemini.asked_about()), 1, "no retry, and the second email is never asked")
+        self.assertEqual(outlook.changes(), [])
+
+    def test_case15b_nothing_is_ever_sent_replied_to_forwarded_or_deleted(self):
+        outlook, gemini = self.two_emails(self.FAILING_TWICE, lead_reply("demo"))
+        self.live(outlook, gemini)
+        for request in outlook.changes():
+            url = request.full_url.lower()
+            for word in ("/send", "/reply", "/forward", "/copy", "/createreply", "/permanentdelete", "replyall"):
+                self.assertNotIn(word, url)
+            self.assertNotEqual(request.get_method(), "DELETE")
+
+    def test_case15b_the_report_says_nothing_about_the_sender_subject_or_text(self):
+        outlook, gemini = self.private_lead()
+        gemini = PretendGemini({self.PRIVATE_SUBJECT: Raise(requests.exceptions.Timeout("slow PRIVATE-X"))})
+        short = outlook_triage.short_id(outlook.inbox["p1"])
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 1)
+        self.assertIn(f"{short}: left untouched in the Inbox.", output.splitlines())
+        self.assert_nothing_private(output)
 
     def test_case15_a_gemini_server_error_is_treated_the_same(self):
         outlook = PretendOutlook([msg("m1", "Demo please")])
@@ -1361,7 +1487,7 @@ class TriageTests(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertIn("I couldn't reach the AI service", output)
                 self.assertIn(hint, output)
-                self.assertIn("Stopped", output)
+                self.assertIn("left untouched in the Inbox", output)
                 self.assertNotIn("overloaded", output)
                 self.assertNotIn(BODY_MARKER, output)
                 self.assertEqual(outlook.changes(), [])

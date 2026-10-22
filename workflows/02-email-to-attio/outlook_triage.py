@@ -73,6 +73,7 @@ from outlook_to_slack import GRAPH_URL, WEB_TIMEOUT_SECONDS, find_leads_folder, 
 STATE_PATH = HERE / "triage-state.json"
 STATELESS = False       # set by each run from --stateless: no state file is read or written, the mailbox is the memory
 LOOKBACK_DAYS = 7
+MAX_FAILURES_IN_A_ROW = 3   # Gemini failing for this many emails in a row means it is down: stop asking
 MAX_PER_RUN = 25
 MAX_PAGES = 10
 PAGE_SIZE = 50
@@ -449,6 +450,8 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
     posted = 0
     drafts_made = 0
     drafts_skipped = 0
+    failed = 0       # emails Gemini could not answer even after its retry (left untouched)
+    in_a_row = 0
     current = None
     try:
         for message, kind in eligible:
@@ -467,7 +470,20 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
                 if asked:
                     time.sleep(extract_leads.PAUSE_SECONDS)
                 asked += 1
-                raw = ask_gemini(model, key, build_message(prompt, email_text(message)))
+                try:
+                    raw = ask_gemini(model, key, build_message(prompt, email_text(message)))
+                except extract_leads.GeminiUnreachable as problem:
+                    # Still no answer after the one retry. Nothing was changed for this email, so leave it as it
+                    # is (the next run asks again) and carry on. The failure is reported at the end.
+                    failed += 1
+                    in_a_row += 1
+                    print(problem)
+                    print(f"{label}: left untouched in the Inbox.")
+                    if in_a_row >= MAX_FAILURES_IN_A_ROW:
+                        print("The AI service kept failing, so I stopped. The rest were left untouched.")
+                        break
+                    continue
+                in_a_row = 0
                 parsed = parse_reply(raw)
                 result, _problems = v3_reply.read_v3(parsed)
                 category, urgency = result["category"], result["urgency"]
@@ -533,6 +549,10 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
             print(f"Reply drafts not made: {drafts_skipped} (a person writes those replies by hand)")
     if waiting:
         print(f"{waiting} still waiting for the next run.")
+    if failed:
+        # One failing exit for the whole run, so the step fails once and the alert goes out once.
+        print(f"Failed (left untouched in the Inbox, asked again by the next run): {failed}")
+        return 1
     return 0
 
 
