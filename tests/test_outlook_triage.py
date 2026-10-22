@@ -50,6 +50,9 @@ TEST_SLACK_URL = f"https://hooks.slack.com/services/T0TEST/B0TEST/{TEST_SLACK_SE
 SLACK_ENV = {"SLACK_WEBHOOK_URL": LIVE_SLACK_URL, "SLACK_TEST_WEBHOOK_URL": TEST_SLACK_URL}
 SECRETS = (FAKE_TOKEN, FAKE_CACHE, FAKE_KEY, LIVE_SLACK_SECRET, TEST_SLACK_SECRET)
 SLACK_MARKER = "com.novawellness.slackposted"
+DRAFT_MARKER = "com.novawellness.draftmade"
+DRAFTS_ID = "drafts-id"
+DRAFT_SELECT = "id,isDraft,parentFolderId,toRecipients,ccRecipients,bccRecipients,conversationId,bodyPreview"
 BODY_MARKER = "PRIVATE-EMAIL-BODY-MARKER"
 
 NOW = datetime.datetime(2026, 10, 21, 12, 0, tzinfo=datetime.timezone.utc)
@@ -60,11 +63,13 @@ OUR_CATEGORIES = ["Lead - Demo", "Lead - Pricing", "Lead - Other", "Needs review
 
 
 def msg(message_id, subject, categories=(), received=RECENT, sender="sam@example.com", body="Hello there",
-        name="Sam", internet_id=None):
+        name="Sam", internet_id=None, reply_to=()):
     message = {
         "id": message_id,
         "subject": subject,
         "from": {"emailAddress": {"address": sender, "name": name}},
+        "replyTo": [{"emailAddress": {"address": a}} for a in reply_to],
+        "conversationId": f"conv-{message_id}",
         "receivedDateTime": received,
         "categories": list(categories),
         "body": {"contentType": "text", "content": f"{body} {BODY_MARKER}"},
@@ -127,7 +132,8 @@ class PretendOutlook:
     """A pretend Outlook mailbox with an Inbox and a Leads folder. Records every request."""
 
     def __init__(self, inbox=(), leads=(), has_leads_folder=True, patch_errors=None,
-                 move_errors=None, unreachable=False, page_size=None, extension_errors=None):
+                 move_errors=None, unreachable=False, page_size=None, extension_errors=None,
+                 draft_errors=None, create_to=None, existing_drafts=()):
         self.inbox = {m["id"]: copy.deepcopy(m) for m in inbox}
         self.leads = {m["id"]: copy.deepcopy(m) for m in leads}
         self.has_leads_folder = has_leads_folder
@@ -141,6 +147,14 @@ class PretendOutlook:
         self.markers = {}             # (message id, extension name) -> a marker such as the Slack one
         self.marker_posts = []        # (message id, body) of every marker saved
         self.marker_errors = {}       # {n: error} for the n-th marker save
+        self.draft_errors = draft_errors or {}    # {step: error}: create, verify_message, verify_folder, drafts_check, marker_write
+        self.create_to = create_to                # makes the new draft come back addressed to this address instead
+        self.drafts = {}                          # draft id -> the draft as Outlook would show it
+        for draft_id, conversation in existing_drafts:
+            self.drafts[draft_id] = {"id": draft_id, "conversationId": conversation, "isDraft": True,
+                                     "parentFolderId": DRAFTS_ID, "toRecipients": [], "ccRecipients": [],
+                                     "bccRecipients": [], "bodyPreview": "Something I wrote myself"}
+        self.draft_comments = []                  # the text of every create-reply request
         self.requests = []
         self.patches = []
         self.moves = []
@@ -174,6 +188,49 @@ class PretendOutlook:
             answer["value"] = values
             return FakeResponse(json.dumps(answer).encode())
 
+        # ---- Drafts (strict, like the real Outlook: only the documented request forms are answered) ----
+        if method == "GET" and path == "/me/mailFolders/drafts":
+            if query != {"$select": ["id"]}:
+                raise http_error(400)
+            self.fail_draft("verify_folder")
+            return FakeResponse(json.dumps({"id": DRAFTS_ID}).encode())
+        if method == "GET" and path == "/me/mailFolders/drafts/messages":
+            wanted = re.fullmatch(r"conversationId eq '(.+)'", (query.get("$filter") or [""])[0])
+            if set(query) != {"$filter", "$select", "$top"} or query["$select"] != ["id"] or not wanted:
+                raise http_error(400)
+            self.fail_draft("drafts_check")
+            found_drafts = [{"id": d["id"]} for d in self.drafts.values() if d["conversationId"] == wanted.group(1)]
+            return FakeResponse(json.dumps({"value": found_drafts}).encode())
+        found = re.fullmatch(r"/me/messages/([^/]+)/createReply", path)
+        if method == "POST" and found:
+            body = json.loads(request.data.decode())
+            if parsed.query or set(body) != {"comment"} or not isinstance(body["comment"], str):
+                raise http_error(400)
+            self.draft_comments.append(body["comment"])
+            self.fail_draft("create")
+            source = self.inbox.get(urllib.parse.unquote(found.group(1))) or self.leads.get(urllib.parse.unquote(found.group(1)))
+            if source is None:
+                raise http_error(404)
+            reply_to = [r["emailAddress"]["address"] for r in source.get("replyTo") or []]
+            to = [self.create_to] if self.create_to else (reply_to or [source["from"]["emailAddress"]["address"]])
+            draft_id = f"draft-{len(self.drafts) + 1}"
+            preview = " ".join(re.sub(r"<[^>]+>", " ", body["comment"]).split())[:255]
+            self.drafts[draft_id] = {
+                "id": draft_id, "conversationId": source["conversationId"], "isDraft": True,
+                "parentFolderId": DRAFTS_ID, "toRecipients": [{"emailAddress": {"address": a}} for a in to],
+                "ccRecipients": [], "bccRecipients": [], "bodyPreview": preview,
+            }
+            return FakeResponse(json.dumps(self.drafts[draft_id]).encode())
+        found = re.fullmatch(r"/me/messages/([^/]+)", path)
+        if method == "GET" and found:
+            if query != {"$select": [DRAFT_SELECT]}:
+                raise http_error(400)
+            self.fail_draft("verify_message")
+            draft = self.drafts.get(urllib.parse.unquote(found.group(1)))
+            if draft is None:
+                raise http_error(404)
+            return FakeResponse(json.dumps(draft).encode())
+
         found = re.fullmatch(r"/me/messages/([^/]+)", path)
         if method == "PATCH" and found:
             message_id = urllib.parse.unquote(found.group(1))
@@ -206,7 +263,9 @@ class PretendOutlook:
             message_id = urllib.parse.unquote(found.group(1))
             body = json.loads(request.data.decode())
             if body.get("extensionName") != EXTENSION_NAME:
-                # a marker (for example the Slack one): kept apart from the saved answers
+                # a marker (the Slack one or the draft one): kept apart from the saved answers
+                if body.get("extensionName") == DRAFT_MARKER:
+                    self.fail_draft("marker_write")
                 self.marker_posts.append((message_id, body))
                 error = self.marker_errors.get(len(self.marker_posts))
                 if error is not None:
@@ -250,6 +309,15 @@ class PretendOutlook:
 
         self.unexpected.append(f"{method} {request.full_url}")
         raise urllib.error.URLError("pretend world: unexpected request")
+
+    def fail_draft(self, step):
+        error = self.draft_errors.get(step)
+        if error is not None:
+            raise error
+
+    def draft_marked(self, message_id):
+        """True if the email (by its Inbox id or its Leads id) carries the draft-made marker."""
+        return ((message_id, DRAFT_MARKER) in self.markers) or (("moved-" + message_id, DRAFT_MARKER) in self.markers)
 
     def methods(self):
         return [r.get_method() for r in self.requests]
@@ -447,7 +515,9 @@ class TriageTests(unittest.TestCase):
                 path = urllib.parse.urlparse(request.full_url).path
                 if path.endswith("/extensions"):
                     named = json.loads(request.data.decode()).get("extensionName") if request.data else None
-                    self.events.append("save" if named == EXTENSION_NAME else "slack_marker")
+                    self.events.append({EXTENSION_NAME: "save", DRAFT_MARKER: "draft_marker"}.get(named, "slack_marker"))
+                elif path.endswith("/createReply"):
+                    self.events.append("draft")
                 elif path.endswith("/move"):
                     self.events.append("move")
                 else:
@@ -1901,6 +1971,314 @@ class TriageTests(unittest.TestCase):
         for request in outlook.requests:
             path = urllib.parse.urlparse(request.full_url).path.lower()
             for word in ("/send", "/reply", "/forward", "/copy", "/createreply", "/permanentdelete"):
+                self.assertNotIn(word, path)
+            self.assertNotIn(request.get_method(), ("DELETE", "PUT"))
+        self.assertEqual(outlook_signin.SCOPES, ["Mail.ReadWrite"])
+
+    # ==== The reply draft step (tests/cases/12-reply-drafts.md, Part B) ==========================
+
+    DRAFTS = ("--drafts", "on")
+    EXPECTED_HTML = (
+        "<p>AI draft - please review before sending</p>\n"
+        "<p>Hello Sam,</p>\n"
+        "<p>Thank you for getting in touch about your enquiry. A member of our team will be in touch.</p>\n"
+        "<p>Kind regards,<br>Nova Wellness Team</p>"
+    )
+
+    def two_draft_leads(self):
+        """Two leads whose saved address is the sender's own, so each should get a draft."""
+        outlook = PretendOutlook([
+            msg("m1", "Demo please", received="2026-10-20T08:00:00Z", sender="one@example.com"),
+            msg("m2", "Prices please", received="2026-10-20T09:00:00Z", sender="two@example.com"),
+        ])
+        gemini = PretendGemini({
+            "Demo please": lead_reply("demo", email="one@example.com"),
+            "Prices please": lead_reply("pricing", email="two@example.com"),
+        })
+        return outlook, gemini
+
+    def one_draft_lead(self, **outlook_options):
+        outlook = PretendOutlook([msg("m1", "Demo please")], **outlook_options)
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        return outlook, gemini
+
+    def test_d1_drafts_are_off_by_default_and_with_off(self):
+        for extra in ((), ("--drafts", "off")):
+            with self.subTest(extra=extra):
+                self.state_path.unlink(missing_ok=True)
+                outlook, gemini = self.one_draft_lead()
+                code, output = self.live(outlook, gemini, *extra)
+                self.assertEqual(code, 0)
+                self.assertEqual(self.events, ["save", "patch", "move"])
+                self.assertEqual(outlook.drafts, {})
+                self.assertNotIn("eply draft", output)
+                for request in outlook.requests:
+                    self.assertNotIn("drafts", request.full_url.lower())
+                    self.assertNotIn("createreply", request.full_url.lower())
+
+    def test_d1_a_value_other_than_off_or_on_is_refused_before_any_request(self):
+        outlook, gemini = self.one_draft_lead()
+        errors = io.StringIO()
+        with mock.patch.object(sys, "stderr", errors):
+            with self.assertRaises(SystemExit):
+                self.live(outlook, gemini, "--drafts", "banana")
+        self.assertIn("invalid choice", errors.getvalue())
+        self.assertEqual(outlook.requests, [])
+
+    def test_d2_the_order_is_save_slack_draft_category_move(self):
+        outlook, gemini = self.one_draft_lead()
+        code, _ = self.live(outlook, gemini, "--slack", "test", *self.DRAFTS)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.events, ["save", "slack:test", "slack_marker", "draft", "draft_marker", "patch", "move"])
+        self.assertTrue(outlook.draft_marked("m1"))
+        self.assertIn(("moved-m1", DRAFT_MARKER), outlook.markers, "the marker travels with the email")
+
+    def test_d2_without_slack_the_order_is_save_draft_category_move(self):
+        outlook, gemini = self.one_draft_lead()
+        self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(self.events, ["save", "draft", "draft_marker", "patch", "move"])
+
+    def test_d2_a_lead_still_goes_to_leads_and_not_to_processed(self):
+        outlook, gemini = self.one_draft_lead()
+        self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(outlook.moves, [("m1", {"destinationId": "leads-id"})])
+        self.assertEqual(outlook.where("m1"), "leads")
+
+    def test_d3_one_draft_is_made_with_the_finished_text_to_the_sender_only(self):
+        outlook, gemini = self.one_draft_lead()
+        code, output = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 0)
+        self.assertEqual(outlook.draft_comments, [self.EXPECTED_HTML])
+        (draft,) = outlook.drafts.values()
+        self.assertEqual([r["emailAddress"]["address"] for r in draft["toRecipients"]], ["sam@example.com"])
+        self.assertEqual((draft["ccRecipients"], draft["bccRecipients"]), ([], []))
+        self.assertIn("  reply draft made in Drafts", output)
+        self.assertIn("Reply drafts made: 1", output)
+
+    def test_d3_no_draft_text_or_name_reaches_the_output_or_a_file(self):
+        outlook, gemini = self.one_draft_lead()
+        code, output = self.live(outlook, gemini, *self.DRAFTS)
+        for private in (CLEAN_DRAFT, "Hello Sam", "Thank you for getting in touch", "AI draft", "Kind regards", "<p>"):
+            self.assertNotIn(private, output)
+            self.assertNotIn(private, self.saved_text())
+
+    def test_d4_only_leads_get_a_draft(self):
+        outlook = PretendOutlook([
+            msg("m1", "Demo please", received="2026-10-20T07:00:00Z"),
+            msg("m2", "Weekly newsletter", received="2026-10-20T08:00:00Z"),
+            msg("m3", "Odd one", received="2026-10-20T09:00:00Z"),
+        ])
+        gemini = PretendGemini({
+            "Demo please": lead_reply("demo"),
+            "Weekly newsletter": NOT_LEAD,
+            "Odd one": json.dumps({"is_lead": False, "category": "Needs review"}),
+        })
+        code, _ = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(outlook.drafts), 1)
+        self.assertTrue(outlook.draft_marked("m1"))
+        for message_id in ("m2", "m3"):
+            self.assertFalse(outlook.draft_marked(message_id))
+
+    def test_d4_a_non_lead_has_no_draft_in_its_changes(self):
+        outlook = PretendOutlook([msg("m1", "Weekly newsletter")])
+        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
+        self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(self.events, ["patch"])
+
+    def test_d5_a_lead_that_gets_no_draft_still_carries_on_and_says_why(self):
+        cases = {
+            "forwarded": (msg("m1", "Demo please"), lead_reply("demo", email="boss@example.com"), "sender"),
+            "reply-to elsewhere": (msg("m1", "Demo please", reply_to=["boss@example.com"]), lead_reply("demo"), "Reply-To"),
+            "no draft": (msg("m1", "Demo please"), lead_reply("demo", draft_reply=None), "no draft"),
+        }
+        for name, (message, reply, word) in cases.items():
+            with self.subTest(case=name):
+                self.state_path.unlink(missing_ok=True)
+                outlook = PretendOutlook([message])
+                gemini = PretendGemini({"Demo please": reply})
+                code, output = self.live(outlook, gemini, *self.DRAFTS)
+                self.assertEqual(code, 0)
+                self.assertEqual(self.events, ["save", "patch", "move"])
+                self.assertEqual(outlook.drafts, {})
+                self.assertEqual(outlook.where("m1"), "leads")
+                self.assertIsNotNone(outlook.saved_answer("m1"))
+                self.assertIn("no reply draft was made", output)
+                self.assertIn(word, output)
+                self.assertIn("Reply drafts not made: 1", output)
+                self.assertNotIn("boss@example.com", output)
+                self.assertNotIn(CLEAN_DRAFT, output)
+
+    def test_d5_the_final_counts_say_how_many_were_made_and_how_many_were_not(self):
+        outlook = PretendOutlook([
+            msg("m1", "Demo please", received="2026-10-20T08:00:00Z", sender="one@example.com"),
+            msg("m2", "Prices please", received="2026-10-20T09:00:00Z", sender="two@example.com"),
+        ])
+        gemini = PretendGemini({
+            "Demo please": lead_reply("demo", email="one@example.com"),
+            "Prices please": lead_reply("pricing", email="elsewhere@example.com"),
+        })
+        code, output = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 0)
+        self.assertIn("Reply drafts made: 1", output)
+        self.assertIn("Reply drafts not made: 1", output)
+        self.assertNotIn("elsewhere@example.com", output)
+
+    def test_d6_if_the_draft_fails_the_run_stops_and_the_email_is_left_untouched(self):
+        outlook, gemini = self.two_draft_leads()
+        outlook.draft_errors = {"create": http_error(500)}
+        code, output = self.live(outlook, gemini, "--slack", "test", *self.DRAFTS)
+        self.assertEqual(code, 1)
+        self.assertIn("refused", output)
+        self.assertIn("Stopped", output)
+        self.assertNotIn("Traceback", output)
+        self.assertEqual((outlook.patches, outlook.moves), ([], []))
+        self.assertEqual((outlook.where("m1"), outlook.where("m2")), ("inbox", "inbox"))
+        self.assertEqual(outlook.categories("m1"), [])
+        self.assertFalse(self.state_path.exists() and "m1" in self.state()["emails"])
+        self.assertIsNotNone(outlook.saved_answer("m1"), "the saved answer stays")
+        self.assertEqual(len(gemini.calls), 1, "nothing is asked or changed for the later email")
+        self.assertFalse(outlook.draft_marked("m1"))
+        self.assertEqual(len(self.slack.posts), 1, "the lead was already announced, once")
+
+    def test_d6_the_next_run_finishes_the_lead_with_one_draft_and_one_post(self):
+        outlook, gemini = self.two_draft_leads()
+        outlook.draft_errors = {"create": http_error(500)}
+        self.live(outlook, gemini, "--slack", "test", *self.DRAFTS)
+        outlook.draft_errors = {}
+        code, output = self.live(outlook, gemini, "--slack", "test", *self.DRAFTS, slack=self.slack)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(outlook.drafts), 2, "one draft for each lead, no more")
+        self.assertEqual(len(self.slack.posts), 2, "one post for each lead, no more")
+        self.assertIn("already posted to Slack earlier", output)
+        self.assertEqual((outlook.where("m1"), outlook.where("m2")), ("leads", "leads"))
+        self.assertTrue(outlook.draft_marked("m1") and outlook.draft_marked("m2"))
+
+    def test_d6_a_refused_sign_in_is_explained_and_the_email_is_left_alone(self):
+        outlook, gemini = self.one_draft_lead()
+        outlook.draft_errors = {"create": http_error(403)}
+        code, output = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 1)
+        self.assertIn("sign-in may need redoing", output)
+        self.assertIn("outlook_signin.py", output)
+        self.assertNotIn("403", output)
+        self.assertEqual((outlook.patches, outlook.moves), ([], []))
+        self.assertEqual(outlook.drafts, {})
+
+    def test_d6_a_lost_connection_while_making_the_draft_is_explained(self):
+        outlook, gemini = self.one_draft_lead()
+        outlook.draft_errors = {"create": urllib.error.URLError("pretend: down")}
+        code, output = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't reach Outlook", output)
+        self.assertNotIn("URLError", output)
+        self.assertEqual((outlook.patches, outlook.moves), ([], []))
+
+    def test_d7_a_draft_that_comes_back_wrong_stops_the_run_and_never_makes_a_second_one(self):
+        outlook, gemini = self.one_draft_lead(create_to="other@example.com")
+        code, output = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 1)
+        self.assertIn("confirm step failed", output)
+        self.assertIn("may be in your Drafts folder", output)
+        self.assertIn("by hand", output)
+        self.assertNotIn("other@example.com", output)
+        self.assertEqual((outlook.patches, outlook.moves), ([], []))
+        self.assertFalse(outlook.draft_marked("m1"))
+        self.assertIsNotNone(outlook.saved_answer("m1"))
+        # next run: the draft that is already in Drafts for this conversation counts, so no second one is made
+        outlook.create_to = None
+        code, output = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(outlook.drafts), 1)
+        self.assertEqual(len(outlook.draft_comments), 1, "exactly one create request in total")
+        self.assertIn("already made earlier", output)
+        self.assertTrue(outlook.draft_marked("m1"))
+        self.assertEqual(outlook.where("m1"), "leads")
+
+    def test_d8_a_retry_after_a_failed_category_change_does_not_make_a_second_draft(self):
+        outlook, gemini = self.one_draft_lead(patch_errors={1: http_error(403)})
+        code, _ = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(outlook.drafts), 1)
+        self.assertTrue(outlook.draft_marked("m1"))
+        code, output = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(outlook.drafts), 1)
+        self.assertEqual(len(outlook.draft_comments), 1)
+        self.assertIn("already made earlier", output)
+        self.assertEqual(outlook.where("m1"), "leads")
+
+    def test_d8_a_move_retry_does_not_touch_drafts_at_all(self):
+        outlook, gemini = self.one_draft_lead(move_errors={1: http_error(500)})
+        code, _ = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 1)
+        code, _ = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 0)
+        creates = [r for r in outlook.requests if r.full_url.endswith("/createReply")]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(len(outlook.drafts), 1)
+        self.assertEqual(outlook.where("m1"), "leads")
+
+    def test_d8_a_second_run_makes_nothing_more(self):
+        outlook, gemini = self.two_draft_leads()
+        self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(len(outlook.drafts), 2)
+        calls = len(gemini.calls)
+        code, _ = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(outlook.drafts), 2)
+        self.assertEqual(len(outlook.draft_comments), 2)
+        self.assertEqual(len(gemini.calls), calls)
+
+    def test_d9_a_draft_already_in_the_conversation_blocks_a_new_one(self):
+        outlook, gemini = self.one_draft_lead(existing_drafts=[("mine-1", "conv-m1")])
+        code, output = self.live(outlook, gemini, *self.DRAFTS)
+        self.assertEqual(code, 0)
+        self.assertEqual(outlook.draft_comments, [])
+        self.assertTrue(outlook.draft_marked("m1"))
+        self.assertIn("already made earlier", output)
+        self.assertEqual(outlook.where("m1"), "leads")
+
+    def test_d10_a_dry_run_says_drafts_are_on_and_changes_and_asks_nothing(self):
+        outlook, gemini = self.two_draft_leads()
+        code, output = self.run_main(outlook, gemini, ["--drafts", "on"])
+        self.assertEqual(code, 0)
+        self.assertEqual(outlook.changes(), [])
+        self.assertEqual(gemini.calls, [])
+        self.assertIn("Reply drafts: on", output)
+        self.assertIn("dry run", output.lower())
+        for request in outlook.requests:
+            self.assertNotIn("drafts", request.full_url.lower())
+            self.assertNotIn("createreply", request.full_url.lower())
+
+    def test_d11_the_only_changes_the_triage_can_ask_for_are_the_five_allowed_ones(self):
+        outlook, gemini = self.two_draft_leads()
+        code, _ = self.live(outlook, gemini, "--slack", "test", *self.DRAFTS)
+        self.assertEqual(code, 0)
+        markers = {EXTENSION_NAME, SLACK_MARKER, DRAFT_MARKER}
+        seen = set()
+        for request in outlook.changes():
+            path = urllib.parse.urlparse(request.full_url).path
+            body = json.loads(request.data.decode())
+            if request.get_method() == "PATCH":
+                self.assertRegex(path, r"^/v1\.0/me/messages/[^/]+$")
+                self.assertEqual(set(body), {"categories"})
+                seen.add("category")
+            elif request.get_method() == "POST" and path.endswith("/extensions"):
+                self.assertIn(body["extensionName"], markers)
+                seen.add("extension")
+            elif request.get_method() == "POST" and path.endswith("/createReply"):
+                self.assertEqual(set(body), {"comment"})
+                seen.add("draft")
+            elif request.get_method() == "POST" and path.endswith("/move"):
+                self.assertEqual(body, {"destinationId": "leads-id"})
+                seen.add("move")
+            else:
+                self.fail(f"an unexpected change was asked for: {request.get_method()} {path}")
+        self.assertEqual(seen, {"category", "extension", "draft", "move"})
+        for request in outlook.requests:
+            path = urllib.parse.urlparse(request.full_url).path.lower()
+            for word in ("/send", "/reply", "/forward", "/copy", "/permanentdelete", "replyall"):
                 self.assertNotIn(word, path)
             self.assertNotIn(request.get_method(), ("DELETE", "PUT"))
         self.assertEqual(outlook_signin.SCOPES, ["Mail.ReadWrite"])

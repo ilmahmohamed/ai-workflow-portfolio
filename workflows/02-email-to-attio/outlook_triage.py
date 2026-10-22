@@ -9,20 +9,25 @@ For a real lead it also saves the answer on the email itself (a small hidden ext
 saved_results.py) before moving the email into the Leads folder, so the Attio step can read it there
 and never needs to ask Gemini again. With --slack test or --slack live it also posts one short message
 to Slack for the lead (see lead_slack.py), once, before the category is added and the email is moved.
-Slack is off by default. Not a lead and Needs review emails stay in the Inbox and get
-nothing saved. Handled emails are remembered in a small state file (triage-state.json, next to this
+Slack is off by default. With --drafts on it then makes one reply draft in the Drafts folder for the
+lead (see reply_drafts.py), addressed only to the sender, once, before the category is added and the
+email is moved; drafts are off by default and a draft is never sent. A lead that should get no draft
+(for example a forwarded enquiry) carries on, and the output says plainly why. Not a lead and Needs
+review emails stay in the Inbox and get nothing saved. Handled emails are remembered in a small state file (triage-state.json, next to this
 script, git-ignored) so nothing is handled twice. The state file holds no lead details.
 
 Dry run by default: it only lists the emails it would send to Gemini and changes
-nothing. Add --live to write to Outlook. It never sends, replies to, forwards,
+nothing. Add --live to write to Outlook. It never sends, replies to everyone, forwards,
 copies or deletes anything. The only changes it asks Outlook for are adding a
-category, saving the answer on a lead's email, and moving a lead to the Leads folder.
+category, saving the answer (and the small once-only markers) on a lead's email, making
+the reply draft (only with --drafts on), and moving a lead to the Leads folder.
 No token or key is ever printed, and no lead detail or draft text is printed or kept in a file.
 
 Run:  python workflows\\02-email-to-attio\\outlook_triage.py
       python workflows\\02-email-to-attio\\outlook_triage.py --only-subject "TRIAGE-TEST"
       python workflows\\02-email-to-attio\\outlook_triage.py --live --only-subject "TRIAGE-TEST"
       python workflows\\02-email-to-attio\\outlook_triage.py --live --slack test
+      python workflows\\02-email-to-attio\\outlook_triage.py --live --drafts on --only-subject "TRIAGE-TEST"
 Needs: MS_CLIENT_ID and MS_TOKEN_CACHE (run outlook_signin.py once first), the msal
        library, and for --live also GEMINI_API_KEY. --slack test needs SLACK_TEST_WEBHOOK_URL and
        --slack live needs SLACK_WEBHOOK_URL (both in .env, never printed).
@@ -46,6 +51,7 @@ sys.path.insert(0, str(HERE.parent / "01-outlook-to-slack"))
 
 import extract_leads  # noqa: E402
 import lead_slack  # noqa: E402
+import reply_drafts  # noqa: E402
 import saved_results  # noqa: E402
 import v3_reply  # noqa: E402
 from extract_leads import ask_gemini, build_message, get_api_key, load_model, load_prompt, parse_reply  # noqa: E402
@@ -81,11 +87,14 @@ SYSTEM_SUBJECT_PATTERNS = tuple(
 EXEMPT_SUBJECT = "triage-test"   # our own test emails are never treated as system emails
 
 PROBLEMS = (SignInProblem, extract_leads.SetupProblem, saved_results.SavedResultProblem,
-            lead_slack.LeadSlackProblem)
+            lead_slack.LeadSlackProblem, reply_drafts.ReplyDraftProblem)
 
 # --slack off|test|live: which Slack link (named in .env) is used. The links themselves are never printed.
 SLACK_MODES = ("off", "test", "live")
 SLACK_SETTINGS = {"test": "SLACK_TEST_WEBHOOK_URL", "live": "SLACK_WEBHOOK_URL"}
+
+# --drafts off|on: whether each lead also gets one reply draft in Outlook's Drafts folder (see reply_drafts.py).
+DRAFT_MODES = ("off", "on")
 
 
 class OutlookRefused(Exception):
@@ -153,7 +162,7 @@ def list_inbox(token, since):
     params = {
         "$filter": "receivedDateTime ge " + since.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "$orderby": "receivedDateTime asc",
-        "$select": "id,subject,from,receivedDateTime,categories,body,internetMessageId",
+        "$select": "id,subject,from,replyTo,conversationId,receivedDateTime,categories,body,internetMessageId",
         "$top": str(PAGE_SIZE),
     }
     target = "/me/mailFolders/inbox/messages"
@@ -337,12 +346,14 @@ def choose_emails(messages, state, since, only_subject):
     return eligible, skipped, system
 
 
-def dry_run(model, prompt_version, eligible, skipped, waiting, slack_mode="off"):
+def dry_run(model, prompt_version, eligible, skipped, waiting, slack_mode="off", drafts_mode="off"):
     print("Dry run: nothing will be sent to Gemini and nothing will be changed in Outlook.")
     print(f"Prompt version: {prompt_version}")
     print(f"Model: {model}")
     if slack_mode != "off":
         print(f"Slack posting: {slack_mode} (nothing is posted in a dry run)")
+    if drafts_mode == "on":
+        print("Reply drafts: on (nothing is made in a dry run)")
     for message, kind in eligible:
         address, _ = sender_of(message)
         action = "would send to Gemini" if kind == "new" else "would retry moving to Leads"
@@ -382,13 +393,15 @@ def remember_system_emails(state, new_system):
 
 
 def live_run(token, key, model, prompt, state, eligible, skipped, waiting, system_count, system_already=0,
-             slack_url=None, slack_mode="off"):
+             slack_url=None, slack_mode="off", drafts_mode="off"):
     leads_id = find_leads_folder(token)   # stops here, before any change, if there is no Leads folder
     counts = {}
     broken = 0
     handled = 0
     asked = 0
     posted = 0
+    drafts_made = 0
+    drafts_skipped = 0
     try:
         for message, kind in eligible:
             address, _ = sender_of(message)
@@ -423,6 +436,19 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
                             print(f"  posted to Slack ({slack_mode})")
                         else:
                             print("  already posted to Slack earlier")
+                    if drafts_mode == "on":
+                        # Then one reply draft in Drafts (a marker on the email and a look in Drafts stop a second
+                        # one), still before the email is categorised or moved. If it fails the run stops and the
+                        # email is left as it is. A lead that should get no draft carries on.
+                        status, reason = reply_drafts.make_reply_draft(token, message, result)
+                        if status == "created":
+                            drafts_made += 1
+                            print("  reply draft made in Drafts")
+                        elif status == "exists":
+                            print("  reply draft already made earlier")
+                        else:
+                            drafts_skipped += 1
+                            print(f"  no reply draft was made: {reason}.")
                 add_category(token, message, category)
                 record(state, message["id"], category, "categorised" if is_lead else "done", urgency,
                        message.get("internetMessageId"))
@@ -450,12 +476,16 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
     print(f"Broken replies: {broken}")
     if slack_url:
         print(f"Posted to Slack ({slack_mode}): {posted}")
+    if drafts_mode == "on":
+        print(f"Reply drafts made: {drafts_made}")
+        if drafts_skipped:
+            print(f"Reply drafts not made: {drafts_skipped} (a person writes those replies by hand)")
     if waiting:
         print(f"{waiting} still waiting for the next run.")
     return 0
 
 
-def run(live, only_subject, prompt_version, slack_mode="off"):
+def run(live, only_subject, prompt_version, slack_mode="off", drafts_mode="off"):
     if only_subject is not None and not only_subject.strip():
         raise SignInProblem(
             "The --only-subject text must not be empty, because empty text would match every email."
@@ -497,11 +527,11 @@ def run(live, only_subject, prompt_version, slack_mode="off"):
         return 0
 
     if not live:
-        code = dry_run(model, prompt_version, eligible, skipped, waiting, slack_mode)
+        code = dry_run(model, prompt_version, eligible, skipped, waiting, slack_mode, drafts_mode)
         print_system_count(len(system), system_already)
         return code
     return live_run(token, key, model, prompt, state, eligible, skipped, waiting, len(system), system_already,
-                    slack_url, slack_mode)
+                    slack_url, slack_mode, drafts_mode)
 
 
 def main():
@@ -524,10 +554,16 @@ def main():
         default="off",
         help="post each lead to Slack once: off (default), test (the test channel) or live (the real #leads channel)",
     )
+    parser.add_argument(
+        "--drafts",
+        choices=DRAFT_MODES,
+        default="off",
+        help="make one reply draft in Drafts for each lead (never sent): off (default) or on",
+    )
     args = parser.parse_args()
 
     try:
-        return run(args.live, args.only_subject, args.prompt, args.slack)
+        return run(args.live, args.only_subject, args.prompt, args.slack, args.drafts)
     except PROBLEMS as problem:
         print(problem)
         return 1
