@@ -522,6 +522,189 @@ class ExtractionTests(unittest.TestCase):
         self.assertFalse(self.accuracy_path.exists())
         self.assertNotIn("Traceback", output)
 
+    # ---- Case 6b: a temporary 503 is retried once (tests/cases/10-single-call-v3.md, Case 8) ----
+
+    def jonas_calls(self, world):
+        return len([t for t in world.texts() if JONAS_MARKER in t])
+
+    def test_v3case8_a_503_then_a_good_answer_carries_on(self):
+        replies = good_replies()
+        replies[JONAS_MARKER] = [Status(503, "overloaded"), json.dumps(JONAS)]
+        world = PretendGemini(replies)
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.jonas_calls(world), 2)
+        self.assertIn(extract_leads.BUSY_WAIT_SECONDS, self.sleeps)
+        self.assertIn("15 of 15", output)
+
+    def test_v3case8_two_503s_in_a_row_stop_with_the_plain_message_after_exactly_two_requests(self):
+        replies = good_replies()
+        replies[JONAS_MARKER] = Status(503, f"overloaded {FAKE_KEY} Blue Reed Yoga")
+        world = PretendGemini(replies)
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't reach the AI service (Gemini answered with code 503)", output)
+        self.assertEqual(self.jonas_calls(world), 2)
+        self.assertNotIn("overloaded", output)
+        self.assertNotIn("Blue Reed Yoga", output)
+        self.assertFalse(self.accuracy_path.exists())
+
+    def test_v3case8_500_and_502_are_not_retried(self):
+        for code_number in (500, 502, 504):
+            with self.subTest(code=code_number):
+                replies = good_replies()
+                replies[JONAS_MARKER] = Status(code_number, "broken")
+                world = PretendGemini(replies)
+                code, output = self.run_main(world, ["--live"])
+                self.assertEqual(code, 1)
+                self.assertIn(f"(Gemini answered with code {code_number})", output)
+                self.assertEqual(self.jonas_calls(world), 1)
+
+    def test_v3case8_only_one_retry_in_total_even_when_the_two_problems_differ(self):
+        for first, second, words in (
+            (Status(429, "slow"), Status(503, "busy"), "code 503"),
+            (Status(503, "busy"), Status(429, "slow"), "free limit"),
+        ):
+            with self.subTest(first=first.code, second=second.code):
+                replies = good_replies()
+                replies[JONAS_MARKER] = [first, second, json.dumps(JONAS)]
+                world = PretendGemini(replies)
+                code, output = self.run_main(world, ["--live"])
+                self.assertEqual(code, 1)
+                self.assertIn(words, output)
+                self.assertEqual(self.jonas_calls(world), 2)
+
+    def test_v3case8_a_429_is_still_handled_as_before(self):
+        replies = good_replies()
+        replies[JONAS_MARKER] = [Status(429, "slow down"), json.dumps(JONAS)]
+        world = PretendGemini(replies)
+        code, _ = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        self.assertIn(extract_leads.RETRY_WAIT_SECONDS, self.sleeps)
+        self.assertNotIn(extract_leads.BUSY_WAIT_SECONDS, self.sleeps)
+
+    # ---- The v3 report (tests/cases/10-single-call-v3.md, Case 7) -------------
+
+    CLEAN = (
+        "Hello Jonas, thank you for getting in touch about pricing for your studio. "
+        "A member of our team will be in touch."
+    )
+
+    def v3_replies(self, darius_draft="Hello Darius, thank you for getting in touch about a demo. A member of our team will be in touch."):
+        return {
+            JONAS_MARKER: json.dumps({**JONAS, "category": "Lead - Pricing", "draft_reply": self.CLEAN}),
+            HANNAH_MARKER: json.dumps({"is_lead": False, "category": "Not a lead"}),
+            DARIUS_MARKER: json.dumps({**DARIUS, "category": "Lead - Demo", "draft_reply": darius_draft}),
+        }
+
+    def use_v3_prompt(self):
+        (self.prompts_dir / "v3.md").write_text(
+            'PROMPT-V3: read the email and answer in JSON with "category" and "draft_reply".', encoding="utf-8"
+        )
+
+    def test_v3_the_field_score_is_worked_out_as_for_v2(self):
+        self.use_v3_prompt()
+        world = PretendGemini(self.v3_replies())
+        code, output = self.run_main(world, ["--live", "--prompt", "v3"])
+        self.assertEqual(code, 0)
+        self.assertIn("Accuracy: 100.0% (15 of 15 fields correct)", output)
+        self.assertIn("PROMPT-V3", world.texts()[0])
+
+    def test_v3_the_category_is_scored_separately(self):
+        self.use_v3_prompt()
+        replies = self.v3_replies()
+        replies[JONAS_MARKER] = json.dumps({**JONAS, "category": "Lead - Demo", "draft_reply": self.CLEAN})
+        world = PretendGemini(replies)
+        code, output = self.run_main(world, ["--live", "--prompt", "v3"])
+        self.assertEqual(code, 0)
+        self.assertIn("Accuracy: 100.0% (15 of 15 fields correct)", output, "the field score does not count the category")
+        self.assertIn("Category: 2 of 3 correct (66.7%)", output)
+
+    def test_v3_a_clean_run_reports_zero_draft_violations_and_a_sample(self):
+        self.use_v3_prompt()
+        world = PretendGemini(self.v3_replies())
+        code, output = self.run_main(world, ["--live", "--prompt", "v3"])
+        self.assertEqual(code, 0)
+        self.assertIn("Category: 3 of 3 correct (100.0%)", output)
+        self.assertIn("Draft rules: 0 violations in 2 drafts.", output)
+        self.assertIn("Sample drafts", output)
+        self.assertIn("Email 9 (Lead - Pricing):", output)
+        self.assertIn("    AI draft - please review before sending", output)
+        self.assertIn(self.CLEAN, output)
+        self.assertIn("    Kind regards,", output)
+        self.assertIn("    Nova Wellness Team", output)
+
+    def test_v3_a_draft_that_breaks_a_rule_is_named_and_not_shown_as_a_sample(self):
+        self.use_v3_prompt()
+        world = PretendGemini(self.v3_replies(darius_draft="Hello Darius, we will fix it today for $5."))
+        code, output = self.run_main(world, ["--live", "--prompt", "v3"])
+        self.assertEqual(code, 0)
+        self.assertIn("Draft rules: 1 draft broke a rule:", output)
+        self.assertIn("Email 4:", output)
+        self.assertIn("money", output)
+        self.assertNotIn("we will fix it today", output)
+        self.assertIn("Email 9 (Lead - Pricing):", output)
+        self.assertNotIn("Email 4 (Lead - Demo):", output)
+
+    def test_v3_the_score_row_shows_the_category_and_the_violations(self):
+        self.use_v3_prompt()
+        world = PretendGemini(self.v3_replies(darius_draft="Hello Darius, it is free."))
+        self.run_main(world, ["--live", "--prompt", "v3"])
+        rows = score_rows(self.accuracy_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), 1)
+        self.assertIn("| v3 |", rows[0])
+        self.assertIn("category 3/3", rows[0])
+        self.assertIn("draft violations 1", rows[0])
+        self.assertIn("is_lead 3/3", rows[0])
+
+    def test_v3_the_saved_replies_keep_what_was_read_including_the_problems(self):
+        self.use_v3_prompt()
+        world = PretendGemini(self.v3_replies(darius_draft="Hello Darius, it is free."))
+        self.run_main(world, ["--live", "--prompt", "v3"])
+        files = list(self.results_dir.glob("*.json"))
+        self.assertEqual(len(files), 1)
+        saved = json.loads(files[0].read_text(encoding="utf-8"))
+        by_id = {r["id"]: r for r in saved["replies"]}
+        self.assertEqual(by_id[9]["v3_result"]["category"], "Lead - Pricing")
+        self.assertEqual(by_id[9]["v3_result"]["draft_reply"], self.CLEAN)
+        self.assertEqual(by_id[9]["v3_problems"], [])
+        self.assertIsNone(by_id[4]["v3_result"]["draft_reply"])
+        self.assertTrue(by_id[4]["v3_problems"])
+        self.assertEqual(by_id[5]["v3_result"]["category"], "Not a lead")
+
+    def test_v3_the_sample_has_at_most_four_drafts(self):
+        self.use_v3_prompt()
+        emails = "# Many\n\n" + "".join(
+            f"-----\n\n## Email {i}\nFrom: Person {i} <p{i}@example.com>\nSubject: Pricing please {i}\nBody:\nPLENTY-{i} hello\n\n"
+            for i in range(1, 11)
+        )
+        expected = [
+            {"id": i, "is_lead": True, "name": f"Person {i}", "email": f"p{i}@example.com", "company": None,
+             "role": None, "request_type": "pricing", "urgency": 1, "summary": ANSWER_KEY_MARKER}
+            for i in range(1, 11)
+        ]
+        self.emails_path.write_text(emails, encoding="utf-8")
+        self.expected_path.write_text(json.dumps(expected), encoding="utf-8")
+        replies = {
+            f"PLENTY-{i} ": json.dumps({**expected[i - 1], "summary": "s", "category": "Lead - Pricing", "draft_reply": self.CLEAN})
+            for i in range(1, 11)
+        }
+        world = PretendGemini(replies)
+        code, output = self.run_main(world, ["--live", "--prompt", "v3"])
+        self.assertEqual(code, 0)
+        self.assertEqual(output.count("(Lead - Pricing):"), 4)
+        self.assertIn("Draft rules: 0 violations in 10 drafts.", output)
+
+    def test_v3_a_v1_or_v2_run_shows_no_v3_lines(self):
+        world = PretendGemini(good_replies())
+        code, output = self.run_main(world, ["--live"])
+        self.assertEqual(code, 0)
+        for text in ("Category:", "Draft rules:", "Sample drafts"):
+            self.assertNotIn(text, output)
+        row = score_rows(self.accuracy_path.read_text(encoding="utf-8"))[0]
+        self.assertNotIn("category", row)
+        self.assertNotIn("draft violations", row)
+
     # ---- Case 7: GEMINI_API_KEY is missing --------------------------------
 
     def test_case7_missing_key_stops_before_any_call(self):

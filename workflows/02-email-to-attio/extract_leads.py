@@ -30,6 +30,8 @@ from pathlib import Path
 
 import requests
 
+import v3_reply
+
 HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = HERE.parents[1]
 
@@ -46,6 +48,8 @@ KEY_NAME = "GEMINI_API_KEY"
 REQUEST_TIMEOUT = 60
 PAUSE_SECONDS = 6          # between emails, to stay inside the free per-minute limit
 RETRY_WAIT_SECONDS = 30    # wait before the one retry after "too many requests"
+BUSY_WAIT_SECONDS = 10     # wait before the one retry after a temporary 503 ("busy")
+SAMPLE_NOTE = f"up to {v3_reply.SAMPLE_LIMIT}, spread across the leads"
 GENERATION_SEED = 42       # a fixed seed, to keep answers as repeatable as the API allows
 _seed_rejected = False     # set for the rest of the run if Gemini does not accept the seed setting
 
@@ -217,6 +221,8 @@ def call_once(model, key, message):
             return ""  # no usable answer, so it will count as a broken reply
     if code == 429:
         raise RateLimited()
+    if code == 503:
+        raise ServiceBusy()
     if code in (401, 403) or (code == 400 and "api key" in response.text.lower()):
         raise SetupProblem("Gemini did not accept the key. Check it and try again.")
     if code == 404:
@@ -232,18 +238,29 @@ class RateLimited(Exception):
     pass
 
 
+class ServiceBusy(Exception):
+    """Gemini answered 503: temporarily busy."""
+
+
 def ask_gemini(model, key, message):
-    """Ask once; if the free limit is hit, wait and try one more time."""
+    """Ask once; if the free limit is hit or Gemini is busy (503), wait and try one more time.
+
+    There is only one retry in total, whichever of the two problems came first.
+    """
     try:
         return call_once(model, key, message)
     except RateLimited:
         time.sleep(RETRY_WAIT_SECONDS)
+    except ServiceBusy:
+        time.sleep(BUSY_WAIT_SECONDS)
     try:
         return call_once(model, key, message)
     except RateLimited:
         raise SetupProblem(
             "The free limit was reached, so I stopped. Nothing was saved. Please try again later."
         )
+    except ServiceBusy:
+        raise unreachable("Gemini answered with code 503")
 
 
 def parse_reply(raw):
@@ -313,6 +330,8 @@ def save_score(prompt_label, model, result):
             encoding="utf-8",
         )
     per_field = "; ".join(f"{f} {c}/{t}" for f, (c, t) in result["per_field"].items())
+    if result.get("extra"):
+        per_field += "; " + "; ".join(result["extra"])
     row = (
         f"| {datetime.date.today().isoformat()} | {prompt_label} | {model} "
         f"| {percent(result['accuracy'])} ({result['correct']}/{result['total']}) "
@@ -409,6 +428,19 @@ def live_run(prompt_version, model, prompt, emails, expected, set_name=None, onl
         return 0
 
     result = score_results(expected, answers)
+    # A prompt that asks for a draft reply is a v3-style prompt: check the category and the drafts too.
+    report = None
+    if '"draft_reply"' in prompt:
+        report = v3_reply.v3_report(expected, answers)
+        correct_categories, total_categories = report["category"]
+        result["extra"] = [
+            f"category {correct_categories}/{total_categories}",
+            f"draft violations {len(report['violations'])}",
+        ]
+        for reply in replies:
+            read, problems = v3_reply.read_v3(reply["parsed"])
+            reply["v3_result"] = read
+            reply["v3_problems"] = problems
     label = f"{prompt_version} [{set_name}]" if set_name else prompt_version
     save_score(label, model, result)
     saved = save_replies(prompt_version, model, result, replies, set_name)
@@ -421,8 +453,36 @@ def live_run(prompt_version, model, prompt, emails, expected, set_name=None, onl
     print(f"Broken replies: {result['broken']}")
     for field, (correct, total) in result["per_field"].items():
         print(f"  {field}: {correct} of {total}")
+    if report is not None:
+        print_v3_report(report)
     print(f"Score added to {ACCURACY_PATH.name}. Replies saved in {saved.parent.name}\\{saved.name}.")
     return 0
+
+
+def print_v3_report(report):
+    """The extra lines for a v3 run: category score, draft rule violations and a sample to read."""
+    correct, total = report["category"]
+    print(f"Category: {correct} of {total} correct ({percent(correct / total if total else 0.0)})")
+    for email_id, problems in report["category_problems"]:
+        print(f"  Email {email_id}: {'; '.join(problems)}")
+    violations = report["violations"]
+    if violations:
+        noun = "draft" if len(violations) == 1 else "drafts"
+        print(f"Draft rules: {len(violations)} {noun} broke a rule:")
+        for email_id, problems in violations:
+            print(f"  Email {email_id}: {'; '.join(problems)}")
+    else:
+        count = report["drafts_ok"]
+        print(f"Draft rules: 0 violations in {count} {'draft' if count == 1 else 'drafts'}.")
+    if report["drafts_missing"]:
+        print(f"Leads with no draft at all: {report['drafts_missing']}")
+    if report["samples"]:
+        print(f"\nSample drafts ({SAMPLE_NOTE}):")
+        for email_id, category, text in report["samples"]:
+            print(f"  Email {email_id} ({category}):")
+            for line in text.splitlines():
+                print(f"    {line}" if line else "")
+    print()
 
 
 def main():
