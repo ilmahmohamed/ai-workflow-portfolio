@@ -68,9 +68,17 @@ def msg(message_id, subject, categories=(), received=RECENT, sender="sam@example
     return message
 
 
-def lead_reply(request_type, urgency=1):
-    return json.dumps({
+CATEGORY_FOR = {"demo": "Lead - Demo", "pricing": "Lead - Pricing",
+                "partnership": "Lead - Other", "other": "Lead - Other"}
+CLEAN_DRAFT = "Hello Sam, thank you for getting in touch about your enquiry. A member of our team will be in touch."
+EXTENSION_NAME = "com.novawellness.leadresult"
+
+
+def lead_answer(request_type, urgency=1, **changes):
+    """What prompt v3 gets back for a lead (as a dict)."""
+    answer = {
         "is_lead": True,
+        "category": CATEGORY_FOR.get(request_type, "Lead - Other"),
         "name": "Sam",
         "email": "sam@example.com",
         "company": None,
@@ -78,10 +86,17 @@ def lead_reply(request_type, urgency=1):
         "request_type": request_type,
         "urgency": urgency,
         "summary": "A short summary.",
-    })
+        "draft_reply": CLEAN_DRAFT,
+    }
+    answer.update(changes)
+    return answer
 
 
-NOT_LEAD = json.dumps({"is_lead": False})
+def lead_reply(request_type, urgency=1, **changes):
+    return json.dumps(lead_answer(request_type, urgency, **changes))
+
+
+NOT_LEAD = json.dumps({"is_lead": False, "category": "Not a lead"})
 
 
 def http_error(code):
@@ -106,7 +121,7 @@ class PretendOutlook:
     """A pretend Outlook mailbox with an Inbox and a Leads folder. Records every request."""
 
     def __init__(self, inbox=(), leads=(), has_leads_folder=True, patch_errors=None,
-                 move_errors=None, unreachable=False, page_size=None):
+                 move_errors=None, unreachable=False, page_size=None, extension_errors=None):
         self.inbox = {m["id"]: copy.deepcopy(m) for m in inbox}
         self.leads = {m["id"]: copy.deepcopy(m) for m in leads}
         self.has_leads_folder = has_leads_folder
@@ -114,6 +129,9 @@ class PretendOutlook:
         self.move_errors = move_errors or {}
         self.unreachable = unreachable
         self.page_size = page_size
+        self.extension_errors = extension_errors or {}   # {n: error} for the n-th save of an answer
+        self.extensions = {}          # message id -> the saved extension (ours)
+        self.extension_posts = []     # (message id, body) of every save
         self.requests = []
         self.patches = []
         self.moves = []
@@ -160,6 +178,32 @@ class PretendOutlook:
                 target["categories"] = list(body["categories"])
                 return FakeResponse(json.dumps(target).encode())
 
+        found = re.fullmatch(r"/me/messages/([^/]+)/extensions/([^/]+)", path)
+        if method == "GET" and found:
+            # Strict, like the real Outlook: only the documented form (one extension, read by its
+            # name, no query string) is answered.
+            if parsed.query:
+                raise http_error(400)
+            saved = self.extensions.get(urllib.parse.unquote(found.group(1)))
+            if saved is not None and saved["extensionName"] == urllib.parse.unquote(found.group(2)):
+                return FakeResponse(json.dumps(saved).encode())
+            raise http_error(404)
+
+        found = re.fullmatch(r"/me/messages/([^/]+)/extensions", path)
+        if method == "POST" and found:
+            message_id = urllib.parse.unquote(found.group(1))
+            body = json.loads(request.data.decode())
+            self.extension_posts.append((message_id, body))
+            error = self.extension_errors.get(len(self.extension_posts))
+            if error is not None:
+                raise error
+            if message_id in self.inbox or message_id in self.leads:
+                stored = {"@odata.type": "#microsoft.graph.openTypeExtension",
+                          "id": "Microsoft.OutlookServices.OpenTypeExtension." + body["extensionName"],
+                          **{k: v for k, v in body.items() if k != "@odata.type"}}
+                self.extensions[message_id] = stored
+                return FakeResponse(json.dumps(stored).encode())
+
         found = re.fullmatch(r"/me/messages/([^/]+)/move", path)
         if method == "POST" and found:
             message_id = urllib.parse.unquote(found.group(1))
@@ -172,6 +216,8 @@ class PretendOutlook:
             if moved is not None:
                 moved["id"] = "moved-" + message_id
                 self.leads[moved["id"]] = moved
+                if message_id in self.extensions:        # saved data travels with the email
+                    self.extensions[moved["id"]] = self.extensions.pop(message_id)
                 return FakeResponse(json.dumps({"id": moved["id"]}).encode())
 
         self.unexpected.append(f"{method} {request.full_url}")
@@ -185,6 +231,11 @@ class PretendOutlook:
 
     def categories(self, message_id):
         return (self.inbox.get(message_id) or self.leads.get(message_id))["categories"]
+
+    def saved_answer(self, message_id):
+        """The answer saved on an email (by its Inbox id or its Leads id), or None."""
+        saved = self.extensions.get(message_id) or self.extensions.get("moved-" + message_id)
+        return json.loads(saved["data"]) if saved else None
 
     def where(self, message_id):
         if message_id in self.inbox:
@@ -264,6 +315,8 @@ class TriageTests(unittest.TestCase):
         self.prompts_dir.mkdir()
         (self.prompts_dir / "v1.md").write_text("PROMPT-V1: read the email.", encoding="utf-8")
         (self.prompts_dir / "v2.md").write_text("PROMPT-V2: read the email carefully.", encoding="utf-8")
+        (self.prompts_dir / "v3.md").write_text(
+            'PROMPT-V3: read the email, answer in JSON with "category" and "draft_reply".', encoding="utf-8")
         self.state_path = self.tmp / "triage-state.json"
 
         for module, name, value in (
@@ -777,7 +830,7 @@ class TriageTests(unittest.TestCase):
 
     # ---- Case 22: nothing is sent, replied to or deleted -----------------------------------------------------------------------------------------------
 
-    def test_case22_only_category_updates_and_moves_to_leads_are_ever_sent(self):
+    def test_case22_only_category_updates_saved_answers_and_moves_to_leads_are_ever_sent(self):
         outlook = PretendOutlook([
             msg("m1", "Demo please", received="2026-10-20T07:00:00Z"),
             msg("m2", "Weekly newsletter", received="2026-10-20T08:00:00Z"),
@@ -793,7 +846,8 @@ class TriageTests(unittest.TestCase):
         for request in outlook.changes():
             url = request.full_url.lower()
             if request.get_method() == "POST":
-                self.assertTrue(url.split("?")[0].endswith("/move"))
+                # a lead's move, or saving its answer on it (one extension of the fixed name)
+                self.assertTrue(url.split("?")[0].endswith(("/move", "/extensions")))
             for word in ("/send", "/reply", "/forward", "/copy", "/createreply", "/permanentdelete"):
                 self.assertNotIn(word, url)
         for _, body in outlook.patches:
@@ -1241,11 +1295,12 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("s1", self.state()["system_skipped"])
 
-    def test_prompt_v2_and_the_config_model_are_used(self):
+    def test_prompt_v3_and_the_config_model_are_used(self):
         outlook = PretendOutlook([msg("m1", "Demo please")])
         gemini = PretendGemini({"Demo please": lead_reply("demo")})
         self.live(outlook, gemini)
-        self.assertIn("PROMPT-V2", gemini.asked_about()[0])
+        self.assertIn("PROMPT-V3", gemini.asked_about()[0])
+        self.assertNotIn("PROMPT-V2", gemini.asked_about()[0])
         self.assertNotIn("PROMPT-V1", gemini.asked_about()[0])
         self.assertIn("fake-model-a", gemini.calls[0]["url"])
 
@@ -1274,6 +1329,252 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("No new emails", output)
         self.assertEqual(outlook.changes(), [])
+
+
+    # ==== Step 3: one Gemini call per email, the answer saved on the email ===========
+    # (tests/cases/11-single-call-pipeline.md, Part A)
+
+    def change_kinds(self, outlook):
+        """The change requests sent, in order, as short labels."""
+        kinds = []
+        for request in outlook.changes():
+            path = urllib.parse.urlparse(request.full_url).path
+            if path.endswith("/extensions"):
+                kinds.append("save")
+            elif path.endswith("/move"):
+                kinds.append("move")
+            else:
+                kinds.append(request.get_method().lower())
+        return kinds
+
+    def test_t1_the_default_prompt_is_v3_and_each_new_email_gets_exactly_one_request(self):
+        outlook = PretendOutlook([
+            msg("m1", "Demo please", received="2026-10-20T08:00:00Z"),
+            msg("m2", "Weekly newsletter", received="2026-10-20T09:00:00Z"),
+        ])
+        gemini = PretendGemini({"Demo please": lead_reply("demo"), "Weekly newsletter": NOT_LEAD})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(gemini.calls), 2)
+        for call in gemini.calls:
+            self.assertIn("PROMPT-V3", call["text"])
+            self.assertNotIn("PROMPT-V2", call["text"])
+        self.assertEqual(outlook.where("m1"), "leads")
+
+    def test_t1_a_second_run_asks_nothing_about_emails_already_handled(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        self.live(outlook, gemini)
+        self.assertEqual(len(gemini.calls), 1)
+        self.live(outlook, gemini)
+        self.assertEqual(len(gemini.calls), 1)
+
+    def test_t1_a_move_retry_sends_no_request_to_gemini(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")], move_errors={1: http_error(500)})
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.state()["emails"]["m1"]["stage"], "categorised")
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(gemini.calls), 1, "the retry only moves the email")
+        self.assertEqual(len(outlook.extension_posts), 1, "the answer is not saved twice")
+        self.assertEqual(outlook.where("m1"), "leads")
+        self.assertIsNotNone(outlook.saved_answer("m1"))
+
+    def test_t2_a_leads_full_answer_is_saved_on_the_email(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        answer = lead_answer("demo", 3, name="Sam Jones", company="Jones Gym", role="Owner",
+                             summary="Wants a demo.")
+        gemini = PretendGemini({"Demo please": json.dumps(answer)})
+        self.live(outlook, gemini)
+        self.assertEqual(len(outlook.extension_posts), 1)
+        message_id, body = outlook.extension_posts[0]
+        self.assertEqual(message_id, "m1")
+        self.assertEqual(set(body), {"@odata.type", "extensionName", "version", "data"})
+        self.assertEqual(body["extensionName"], EXTENSION_NAME)
+        self.assertEqual(body["version"], 1)
+        saved = outlook.saved_answer("m1")
+        self.assertEqual(saved, answer)
+        self.assertEqual(set(saved), {"is_lead", "category", "name", "email", "company", "role",
+                                      "request_type", "urgency", "summary", "draft_reply"})
+
+    def test_t2_only_the_extracted_fields_are_saved_never_the_email_itself(self):
+        outlook = PretendOutlook([msg("m1", "A very particular subject", body="Some private words",
+                                      name="Display Name Marker")])
+        gemini = PretendGemini({"A very particular subject": lead_reply("pricing")})
+        self.live(outlook, gemini)
+        raw = json.dumps(outlook.extension_posts[0][1])
+        for text in (BODY_MARKER, "Some private words", "A very particular subject", "Display Name Marker"):
+            self.assertNotIn(text, raw)
+
+    def test_t2_the_draft_is_saved_as_written_without_the_ai_line_or_the_sign_off(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        self.live(outlook, gemini)
+        saved = outlook.saved_answer("m1")
+        self.assertEqual(saved["draft_reply"], CLEAN_DRAFT)
+        self.assertNotIn("AI draft", saved["draft_reply"])
+        self.assertNotIn("Kind regards", saved["draft_reply"])
+
+    def test_t3_a_lead_is_saved_then_categorised_then_moved(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.change_kinds(outlook), ["save", "patch", "move"])
+        self.assertEqual(self.state()["emails"]["m1"]["stage"], "done")
+
+    def test_t3_a_refused_save_stops_the_run_and_leaves_the_email_untouched(self):
+        for code_number in (401, 403):
+            with self.subTest(code=code_number):
+                self.state_path.unlink(missing_ok=True)
+                outlook = PretendOutlook([msg("m1", "Demo please")], extension_errors={1: http_error(code_number)})
+                gemini = PretendGemini({"Demo please": lead_reply("demo")})
+                code, output = self.live(outlook, gemini)
+                self.assertEqual(code, 1)
+                self.assertIn("sign-in may need redoing", output)
+                self.assertNotIn(str(code_number), output)
+                self.assertEqual(outlook.patches, [])
+                self.assertEqual(outlook.moves, [])
+                self.assertEqual(outlook.where("m1"), "inbox")
+                self.assertEqual(outlook.categories("m1"), [])
+                self.assertFalse(self.state_path.exists() and "m1" in self.state()["emails"])
+
+    def test_t3_a_lost_connection_while_saving_is_explained_and_leaves_the_email_untouched(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")],
+                                 extension_errors={1: urllib.error.URLError("pretend: down")})
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't reach Outlook", output)
+        self.assertEqual((outlook.patches, outlook.moves), ([], []))
+        self.assertFalse(self.state_path.exists() and "m1" in self.state()["emails"])
+
+    def test_t3_after_a_refused_save_the_next_run_tries_the_email_again(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")], extension_errors={1: http_error(500)})
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        self.live(outlook, gemini)
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(outlook.where("m1"), "leads")
+        self.assertEqual(outlook.saved_answer("m1")["category"], "Lead - Demo")
+
+    def test_t3_a_failed_category_change_is_retried_with_a_new_request_and_no_second_save(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")], patch_errors={1: http_error(403)})
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(outlook.extension_posts), 1)
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(gemini.calls), 2, "it asks again, because the answer is kept nowhere but on the email")
+        self.assertEqual(len(outlook.extension_posts), 1, "the first saved answer is kept, no second copy")
+        self.assertEqual(outlook.where("m1"), "leads")
+        self.assertEqual(outlook.categories("moved-m1"), ["Lead - Demo"])
+
+    def test_t4_non_leads_get_a_category_only_and_nothing_is_saved(self):
+        outlook = PretendOutlook([
+            msg("m1", "Weekly newsletter", received="2026-10-20T08:00:00Z"),
+            msg("m2", "Odd one", received="2026-10-20T09:00:00Z"),
+            msg("m3", "Broken one", received="2026-10-20T10:00:00Z"),
+        ])
+        gemini = PretendGemini({
+            "Weekly newsletter": NOT_LEAD,
+            "Odd one": json.dumps({"is_lead": False, "category": "Needs review"}),
+            "Broken one": "this is not json",
+        })
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(outlook.extension_posts, [])
+        self.assertEqual(outlook.categories("m1"), ["Not a lead"])
+        self.assertEqual(outlook.categories("m2"), ["Needs review"])
+        self.assertEqual(outlook.categories("m3"), ["Needs review"])
+        for message_id in ("m1", "m2", "m3"):
+            self.assertEqual(outlook.where(message_id), "inbox")
+
+    def test_t5_a_category_that_does_not_match_the_request_type_is_needs_review(self):
+        for answer in (
+            lead_answer("pricing", category="Lead - Demo"),
+            {k: v for k, v in lead_answer("demo").items() if k != "category"},
+            lead_answer("demo", category="Hot lead"),
+            lead_answer("complaint"),
+        ):
+            with self.subTest(category=answer.get("category"), request_type=answer["request_type"]):
+                self.state_path.unlink(missing_ok=True)
+                outlook = PretendOutlook([msg("m1", "Demo please")])
+                gemini = PretendGemini({"Demo please": json.dumps(answer)})
+                code, _ = self.live(outlook, gemini)
+                self.assertEqual(code, 0)
+                self.assertEqual(outlook.categories("m1"), ["Needs review"])
+                self.assertEqual(outlook.where("m1"), "inbox")
+                self.assertEqual(outlook.extension_posts, [])
+
+    def test_t6_a_lead_whose_draft_breaks_a_rule_is_still_saved_and_moved_without_a_draft(self):
+        bad = "Hello Sam, the price is $50 per month for your enquiry. A member of our team will be in touch."
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo", draft_reply=bad)})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(outlook.where("m1"), "leads")
+        saved = outlook.saved_answer("m1")
+        self.assertEqual(saved["category"], "Lead - Demo")
+        self.assertIsNone(saved["draft_reply"])
+        self.assertIn("no usable draft", output)
+        self.assertNotIn("$50", output)
+        self.assertNotIn("price is", output)
+
+    def test_t7_a_dry_run_sends_nothing_to_gemini_saves_nothing_and_changes_nothing(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, output = self.run_main(outlook, gemini, [])
+        self.assertEqual(code, 0)
+        self.assertEqual(gemini.calls, [])
+        self.assertEqual(outlook.changes(), [])
+        self.assertEqual(outlook.extension_posts, [])
+
+    def test_t8_no_lead_details_reach_the_output_or_any_local_file(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        answer = lead_answer("demo", name="NAME-MARKER-PERSON", company="COMPANY-MARKER-CO",
+                             role="ROLE-MARKER-JOB", summary="SUMMARY-MARKER-TEXT",
+                             draft_reply="Hello there, thank you for your enquiry. A member of our team will be in touch. DRAFT-MARKER-TEXT")
+        gemini = PretendGemini({"Demo please": json.dumps(answer)})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        everything = output + "\n" + self.saved_text()
+        for marker in ("NAME-MARKER-PERSON", "COMPANY-MARKER-CO", "ROLE-MARKER-JOB",
+                       "SUMMARY-MARKER-TEXT", "DRAFT-MARKER-TEXT"):
+            self.assertNotIn(marker, everything)
+        # the answer really was saved, on the email in Outlook
+        self.assertIn("SUMMARY-MARKER-TEXT", json.dumps(outlook.extension_posts))
+
+    def test_t8_a_rule_breaking_draft_text_never_reaches_the_output(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo", draft_reply="DRAFT-MARKER-TEXT costs $9 today")})
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertNotIn("DRAFT-MARKER-TEXT", output + self.saved_text())
+
+    def test_t9_only_safe_requests_are_ever_sent(self):
+        outlook = PretendOutlook([
+            msg("m1", "Demo please", received="2026-10-20T08:00:00Z"),
+            msg("m2", "Weekly newsletter", received="2026-10-20T09:00:00Z"),
+        ])
+        gemini = PretendGemini({"Demo please": lead_reply("demo"), "Weekly newsletter": NOT_LEAD})
+        self.live(outlook, gemini)
+        for request in outlook.requests:
+            path = urllib.parse.urlparse(request.full_url).path.lower()
+            for word in ("/send", "/reply", "/forward", "/copy", "/createreply", "/permanentdelete"):
+                self.assertNotIn(word, path)
+            self.assertNotIn(request.get_method(), ("DELETE", "PUT"))
+        self.assertEqual(self.change_kinds(outlook), ["save", "patch", "move", "patch"])
+        for request in outlook.changes():
+            if request.get_method() == "POST" and request.full_url.endswith("/extensions"):
+                body = json.loads(request.data.decode())
+                self.assertEqual(body["extensionName"], EXTENSION_NAME)
+
+    def test_t9_the_permission_is_still_exactly_mail_readwrite(self):
+        self.assertEqual(outlook_signin.SCOPES, ["Mail.ReadWrite"])
 
 
 if __name__ == "__main__":

@@ -1,16 +1,21 @@
 """Triage new Outlook Inbox emails with Gemini and write the answer back.
 
-For each new email in the Inbox it asks Gemini (prompt v2 by default, model from
-config.json) whether it is a lead. Then it adds one category in Outlook:
+For each new email in the Inbox it asks Gemini ONE question (prompt v3 by default, model from
+config.json). The answer holds everything: whether it is a lead, the category, the lead's details
+and a short draft reply. Then, in Outlook, it adds one category:
   Lead - Demo, Lead - Pricing, Lead - Other, Not a lead or Needs review.
-Real leads are moved into the Leads folder. Not a lead and Needs review emails
-stay in the Inbox. Handled emails are remembered in a small state file
-(triage-state.json, next to this script, git-ignored) so nothing is handled twice.
+The category is checked against the request type, never just trusted (see v3_reply.py).
+For a real lead it also saves the answer on the email itself (a small hidden extension, see
+saved_results.py) before moving the email into the Leads folder, so the Attio step can read it there
+and never needs to ask Gemini again. Not a lead and Needs review emails stay in the Inbox and get
+nothing saved. Handled emails are remembered in a small state file (triage-state.json, next to this
+script, git-ignored) so nothing is handled twice. The state file holds no lead details.
 
 Dry run by default: it only lists the emails it would send to Gemini and changes
 nothing. Add --live to write to Outlook. It never sends, replies to, forwards,
 copies or deletes anything. The only changes it asks Outlook for are adding a
-category and moving a lead to the Leads folder. No token or key is ever printed.
+category, saving the answer on a lead's email, and moving a lead to the Leads folder.
+No token or key is ever printed, and no lead detail or draft text is printed or kept in a file.
 
 Run:  python workflows\\02-email-to-attio\\outlook_triage.py
       python workflows\\02-email-to-attio\\outlook_triage.py --only-subject "TRIAGE-TEST"
@@ -36,6 +41,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "01-outlook-to-slack"))
 
 import extract_leads  # noqa: E402
+import saved_results  # noqa: E402
+import v3_reply  # noqa: E402
 from extract_leads import ask_gemini, build_message, get_api_key, load_model, load_prompt, parse_reply  # noqa: E402
 from outlook_signin import SetupProblem as SignInProblem  # noqa: E402
 from outlook_signin import get_client_id, read_env_text  # noqa: E402
@@ -47,21 +54,9 @@ MAX_PER_RUN = 25
 MAX_PAGES = 10
 PAGE_SIZE = 50
 MAX_BODY_CHARS = 4000
-DEFAULT_PROMPT = "v2"
+DEFAULT_PROMPT = "v3"
 
-LEAD_DEMO = "Lead - Demo"
-LEAD_PRICING = "Lead - Pricing"
-LEAD_OTHER = "Lead - Other"
-NEEDS_REVIEW = "Needs review"
-NOT_A_LEAD = "Not a lead"
-OUR_CATEGORIES = (LEAD_DEMO, LEAD_PRICING, LEAD_OTHER, NEEDS_REVIEW, NOT_A_LEAD)
-REQUEST_TO_CATEGORY = {
-    "demo": LEAD_DEMO,
-    "pricing": LEAD_PRICING,
-    "partnership": LEAD_OTHER,
-    "other": LEAD_OTHER,
-}
-LEAD_REQUIRED_FIELDS = ("name", "email", "company", "role", "request_type", "urgency")
+OUR_CATEGORIES = v3_reply.CATEGORIES
 
 # System and security emails are never sent to Gemini and are left untouched.
 # They are spotted from the sender address and the subject only, never the body
@@ -80,7 +75,7 @@ SYSTEM_SUBJECT_PATTERNS = tuple(
 )
 EXEMPT_SUBJECT = "triage-test"   # our own test emails are never treated as system emails
 
-PROBLEMS = (SignInProblem, extract_leads.SetupProblem)
+PROBLEMS = (SignInProblem, extract_leads.SetupProblem, saved_results.SavedResultProblem)
 
 
 class OutlookRefused(Exception):
@@ -195,23 +190,6 @@ def email_text(message):
     from_line = f"{name} <{address}>" if name and name != address else address
     body = ((message.get("body") or {}).get("content")) or ""
     return f"From: {from_line}\nSubject: {subject_of(message)}\nBody:\n{body[:MAX_BODY_CHARS]}"
-
-
-def classify(parsed):
-    """Turn Gemini's answer into (category, urgency, broken)."""
-    if parsed is None:
-        return NEEDS_REVIEW, None, True
-    flag = parsed.get("is_lead")
-    if flag is False:
-        return NOT_A_LEAD, None, False
-    if flag is True and all(field in parsed for field in LEAD_REQUIRED_FIELDS):
-        request_type = parsed["request_type"]
-        if isinstance(request_type, str) and request_type.strip().lower() in REQUEST_TO_CATEGORY:
-            urgency = parsed["urgency"]
-            if isinstance(urgency, bool) or not isinstance(urgency, int):
-                urgency = None
-            return REQUEST_TO_CATEGORY[request_type.strip().lower()], urgency, False
-    return NEEDS_REVIEW, None, False
 
 
 def has_our_category(message):
@@ -399,9 +377,14 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
                     time.sleep(extract_leads.PAUSE_SECONDS)
                 asked += 1
                 raw = ask_gemini(model, key, build_message(prompt, email_text(message)))
-                category, urgency, was_broken = classify(parse_reply(raw))
-                broken += 1 if was_broken else 0
-                is_lead = category.startswith("Lead - ")
+                parsed = parse_reply(raw)
+                result, _problems = v3_reply.read_v3(parsed)
+                category, urgency = result["category"], result["urgency"]
+                broken += 1 if parsed is None else 0
+                is_lead = category in v3_reply.LEAD_CATEGORIES
+                if is_lead:
+                    # Saved first, while the email's id is known: if this fails nothing else was changed.
+                    saved_results.save_result(token, message["id"], result)
                 add_category(token, message, category)
                 record(state, message["id"], category, "categorised" if is_lead else "done", urgency,
                        message.get("internetMessageId"))
@@ -410,6 +393,8 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
                     state["emails"][message["id"]]["stage"] = "done"
                     save_state(state)
                 print(f"{address}, {subject}: {category}" + (", moved to Leads" if is_lead else ""))
+                if is_lead and result["draft_reply"] is None:
+                    print("  no usable draft was written for this lead, so a person will need to write the reply")
             counts[category] = counts.get(category, 0) + 1
             handled += 1
     except PROBLEMS as problem:
@@ -481,7 +466,11 @@ def main():
     sys.stdout.reconfigure(errors="replace")
     parser = argparse.ArgumentParser(description="Triage new Outlook Inbox emails with Gemini.")
     parser.add_argument("--live", action="store_true", help="really write to Outlook (default is a dry run)")
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help=f"prompt version to use (default {DEFAULT_PROMPT})")
+    parser.add_argument(
+        "--prompt",
+        default=DEFAULT_PROMPT,
+        help=f"prompt version to use (default {DEFAULT_PROMPT}; it must be a v3-style prompt that returns a category and a draft reply)",
+    )
     parser.add_argument(
         "--only-subject",
         metavar="TEXT",

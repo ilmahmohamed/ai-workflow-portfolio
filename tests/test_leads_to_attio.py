@@ -2,7 +2,10 @@
 
 These follow tests/cases/05-attio-sync.md (which is not changed).
 Everything here is fake and self-contained:
-  - a pretend Outlook, a pretend Gemini and a pretend Attio answer in place of the real ones,
+  - a pretend Outlook, a pretend Gemini and a pretend Attio answer in place of the real ones.
+    The Attio step never calls Gemini any more: it reads the answer the triage saved on each
+    email. So the pretend Gemini only holds the answers that were "saved" on the emails, and
+    any request to it fails the test,
   - the internet is blocked, so nothing can leave this computer,
   - .env is swapped for a throwaway file, and any attempt to touch the real
     .env stops the test with an error (the real file is never opened),
@@ -130,7 +133,7 @@ class Status:
 
 class PretendOutlook:
     def __init__(self, leads=(), inbox=(), processed=(), has_leads_folder=True,
-                 has_processed_folder=True, move_errors=None, unreachable=False):
+                 has_processed_folder=True, move_errors=None, unreachable=False, read_error=None):
         self.leads = {m["id"]: copy.deepcopy(m) for m in leads}
         self.inbox = {m["id"]: copy.deepcopy(m) for m in inbox}
         self.processed = {m["id"]: copy.deepcopy(m) for m in processed}
@@ -138,6 +141,8 @@ class PretendOutlook:
         self.has_processed_folder = has_processed_folder
         self.move_errors = move_errors or {}
         self.unreachable = unreachable
+        self.read_error = read_error        # raised when a saved answer is read
+        self.extensions = {}                # message id -> the extension saved on that email
         self.requests = []
         self.moves = []
         self.unexpected = []
@@ -167,6 +172,19 @@ class PretendOutlook:
             values = [copy.deepcopy(m) for m in self.leads.values()]
             return FakeResponse(json.dumps({"value": values}).encode())
 
+        found = re.fullmatch(r"/me/messages/([^/]+)/extensions/([^/]+)", path)
+        if method == "GET" and found:
+            # Strict, like the real Outlook: only the documented form (one extension, read by its
+            # name, no query string) is answered.
+            if parsed.query:
+                raise http_error(400)
+            if self.read_error is not None:
+                raise self.read_error
+            saved = self.extensions.get(urllib.parse.unquote(found.group(1)))
+            if saved is not None and saved["extensionName"] == urllib.parse.unquote(found.group(2)):
+                return FakeResponse(json.dumps(saved).encode())
+            raise http_error(404)
+
         found = re.fullmatch(r"/me/messages/([^/]+)/move", path)
         if method == "POST" and found:
             message_id = urllib.parse.unquote(found.group(1))
@@ -179,6 +197,8 @@ class PretendOutlook:
                 moved = self.leads.pop(message_id)
                 moved["id"] = "moved-" + message_id
                 self.processed[moved["id"]] = moved
+                if message_id in self.extensions:
+                    self.extensions[moved["id"]] = self.extensions.pop(message_id)
                 return FakeResponse(json.dumps({"id": moved["id"]}).encode())
 
         self.unexpected.append(f"{method} {request.full_url}")
@@ -200,30 +220,67 @@ class PretendOutlook:
 
 # ---- a pretend Gemini --------------------------------------------------------------------
 
+REQUEST_CATEGORY = {"demo": "Lead - Demo", "pricing": "Lead - Pricing",
+                    "partnership": "Lead - Other", "other": "Lead - Other"}
+EXTENSION_NAME = "com.novawellness.leadresult"
+
+
+def saved_extension(data_text, version=1):
+    """What Outlook holds on an email once an answer was saved on it."""
+    return {
+        "@odata.type": "#microsoft.graph.openTypeExtension",
+        "extensionName": EXTENSION_NAME,
+        "id": "Microsoft.OutlookServices.OpenTypeExtension." + EXTENSION_NAME,
+        "version": version,
+        "data": data_text,
+    }
+
+
+def saved_from_reply(reply):
+    """The extension the triage would have saved for a pretend answer (a text like info() makes).
+
+    A reply that is not a usable answer (broken text, or not true/false for is_lead) is saved
+    as it is, so the Attio step meets a damaged answer.
+    """
+    if not isinstance(reply, str):
+        return None
+    try:
+        answer = json.loads(reply)
+    except ValueError:
+        return saved_extension(reply)
+    if not isinstance(answer, dict) or not isinstance(answer.get("is_lead"), bool):
+        return saved_extension(reply)
+    if answer["is_lead"] is False:
+        return saved_extension(json.dumps({"is_lead": False, "category": "Not a lead"}))
+    request_type = answer.get("request_type")
+    saved = {"is_lead": True, "category": REQUEST_CATEGORY.get(request_type, "Needs review")}
+    for field in ("name", "email", "company", "role", "request_type", "urgency", "summary"):
+        saved[field] = answer.get(field)
+    saved["draft_reply"] = None
+    return saved_extension(json.dumps(saved))
+
+
 class PretendGemini:
-    """Decides by a word in the email (the subject). Records every request."""
+    """The Attio step never calls Gemini. This holds the answers the triage "saved" on the emails
+    (found by a word in the email, like the subject), and fails the test if Gemini is called."""
 
     def __init__(self, replies=None):
         self.replies = {k: list(v) if isinstance(v, list) else [v] for k, v in (replies or {}).items()}
         self.calls = []
 
     def post(self, url, headers=None, json=None, timeout=None, **kwargs):
-        headers = headers or {}
-        text = json["contents"][0]["parts"][0]["text"]
-        self.calls.append({"url": url, "headers": headers, "text": text})
-        if headers.get("x-goog-api-key") != FAKE_GEMINI_KEY:
-            return FakeHTTP(400, {"error": {"code": 400, "message": "API key not valid.", "status": "INVALID_ARGUMENT"}})
+        self.calls.append({"url": url, "headers": headers or {}, "text": ""})
+        raise AssertionError("the Attio step must never call Gemini")
+
+    def answer_for(self, message):
+        """The pretend saved answer for an email, or None when nothing was saved on it."""
+        address = ((message.get("from") or {}).get("emailAddress")) or {}
+        text = " ".join([message.get("subject") or "", address.get("address") or "",
+                         address.get("name") or "", ((message.get("body") or {}).get("content")) or ""])
         for marker, queue in self.replies.items():
             if marker in text:
-                reply = queue.pop(0) if len(queue) > 1 else queue[0]
-                break
-        else:
-            raise AssertionError("the pretend Gemini was sent an email it knows nothing about")
-        if isinstance(reply, Raise):
-            raise reply.error
-        if isinstance(reply, Status):
-            return FakeHTTP(reply.code, {"error": {"code": reply.code, "message": reply.message}})
-        return FakeHTTP(200, {"candidates": [{"content": {"parts": [{"text": reply}]}}]})
+                return queue[0]
+        return None
 
 
 # ---- a pretend Attio (people, companies, deals, notes) -------------------------------------
@@ -540,6 +597,11 @@ class LeadsToAttioTests(unittest.TestCase):
             token_patch = mock.patch.object(leads_to_attio, "get_access_token", return_value=FAKE_TOKEN)
         env = dict(FAKE_ENV)
         env.update(env_changes or {})
+        for message in list(outlook.leads.values()):
+            if message["id"] not in outlook.extensions:
+                saved = saved_from_reply(gemini.answer_for(message))
+                if saved is not None:
+                    outlook.extensions[message["id"]] = saved
         env_before = self.env_path.read_bytes()
         with mock.patch.dict(os.environ, env), \
                 mock.patch.object(sys, "argv", ["leads_to_attio.py", *argv]), \
@@ -564,6 +626,7 @@ class LeadsToAttioTests(unittest.TestCase):
                 self.assertNotIn(secret, request["path"])
                 self.assertNotIn(secret, json.dumps(request["body"]))
         self.assertNotIn(BODY_MARKER, saved, "email text was saved to a file")
+        self.assertEqual(gemini.calls, [], "the Attio step called Gemini")
         self.assertEqual(outlook.unexpected, [], "an unexpected request went to Outlook")
         self.assertEqual(attio.unexpected, [], "an unexpected request went to Attio")
         self.assertEqual(self.env_path.read_bytes(), env_before, ".env must not change")
@@ -765,7 +828,7 @@ class LeadsToAttioTests(unittest.TestCase):
         outlook.urlopen = twice
         code, _ = self.live(outlook, attio, gemini)
         self.assertEqual(code, 0)
-        self.assertEqual(len(gemini.calls), 1)
+        self.assertEqual(len(gemini.calls), 0)
         self.assertEqual(attio.counts(), (1, 1, 1, 1))
 
     def test_case9_an_email_already_done_but_back_in_leads_is_left_alone(self):
@@ -1101,7 +1164,7 @@ class LeadsToAttioTests(unittest.TestCase):
         code, output = self.dry(outlook, attio, gemini)
         self.assertEqual(code, 0)
         self.assertIn("Dry run", output)
-        self.assertEqual(len(gemini.calls), 1)
+        self.assertEqual(len(gemini.calls), 0)
         self.assertGreater(len(attio.reads()), 0)
         self.assertEqual(attio.writes(), [])
         self.assertEqual(attio.counts(), (0, 0, 0, 0))
@@ -1303,44 +1366,52 @@ class LeadsToAttioTests(unittest.TestCase):
                 self.live(outlook, attio, gemini)
                 self.assertEqual(len(gemini.calls), calls)
 
-    # ---- Case 35: Gemini cannot be used ------------------------------------------------------------------------------------------------------------------------------------------------------------
+    # ---- Case 35 (replaced): the Attio step does not need Gemini at all -----------------------------------------
+    # (tests/cases/11-single-call-pipeline.md, Part B: Cases A1 and A5)
 
-    def test_case35_gemini_trouble_stops_with_the_usual_plain_messages(self):
-        cases = [
-            (Raise(requests.exceptions.ConnectionError("down")), "couldn't reach the AI service (no connection)"),
-            (Status(503, "overloaded"), "(Gemini answered with code 503)"),
-            (Status(403, "denied"), "Gemini did not accept the key"),
-            (Status(429, "slow down"), "free limit"),
-        ]
-        for reply, expected in cases:
-            with self.subTest(expected=expected):
-                self.state_path.unlink(missing_ok=True)
-                outlook, attio, gemini = self.one_lead("Hello", reply)
-                code, output = self.live(outlook, attio, gemini)
-                self.assertEqual(code, 1)
-                self.assertIn(expected, output)
-                self.assertEqual(attio.writes(), [])
-                self.assertEqual(outlook.where("m1"), "leads")
-
-    def test_case35_a_missing_gemini_key_stops_before_anything(self):
+    def test_case35_no_gemini_key_prompt_or_model_is_needed(self):
         outlook, attio, gemini = self.one_lead()
-        code, output = self.live(outlook, attio, gemini, remove=["GEMINI_API_KEY"])
-        self.assertEqual(code, 1)
-        self.assertIn("I can't find GEMINI_API_KEY", output)
-        self.assertEqual(attio.requests, [])
+        self.config_path.unlink()
+        for argv_live in (False, True):
+            with self.subTest(live=argv_live):
+                if argv_live:
+                    code, output = self.live(outlook, attio, gemini, remove=["GEMINI_API_KEY"])
+                else:
+                    code, output = self.dry(outlook, attio, gemini, remove=["GEMINI_API_KEY"])
+                self.assertEqual(code, 0)
+                self.assertNotIn("GEMINI", output)
+                self.assertNotIn("Prompt version", output)
+                self.assertNotIn("model", output.lower())
+        self.assertEqual(outlook.where("m1"), "processed")
+        self.assertEqual(gemini.calls, [])
+
+    def test_case35_the_old_prompt_option_is_gone(self):
+        outlook, attio, gemini = self.one_lead()
+        with mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.live(outlook, attio, gemini, "--prompt", "v2")
         self.assertEqual(outlook.changes(), [])
 
-    def test_case35_emails_finished_before_the_problem_stay_finished(self):
-        outlook = PretendOutlook(leads=[
-            lead_msg("m1", "First email", received="2026-10-20T08:00:00Z"),
-            lead_msg("m2", "Second email", sender="omar@other.example", name="Omar", received="2026-10-20T09:00:00Z"),
-        ])
-        gemini = PretendGemini({"First email": info(), "Second email": Status(503, "overloaded")})
-        attio = PretendAttio()
-        code, _ = self.live(outlook, attio, gemini)
-        self.assertEqual(code, 1)
-        self.assertEqual(outlook.where("m1"), "processed")
-        self.assertEqual(outlook.where("m2"), "leads")
+    def test_case35_a_problem_reading_a_saved_answer_is_not_mistaken_for_needs_a_person(self):
+        cases = [
+            (http_error(401), "sign-in may need redoing"),
+            (http_error(403), "sign-in may need redoing"),
+            (http_error(500), "refused"),
+            (urllib.error.URLError("pretend: down"), "couldn't reach Outlook"),
+        ]
+        for error, words in cases:
+            with self.subTest(error=str(error)[:30]):
+                self.state_path.unlink(missing_ok=True)
+                outlook, attio, gemini = self.one_lead()
+                outlook.read_error = error
+                code, output = self.live(outlook, attio, gemini)
+                self.assertEqual(code, 1)
+                self.assertIn(words, output)
+                self.assertNotIn("Needs a person", output)
+                self.assertEqual(attio.writes(), [])
+                self.assertEqual(outlook.where("m1"), "leads")
+                if self.state_path.exists():
+                    self.assertNotIn("attention", self.state_path.read_text(encoding="utf-8"))
 
     # ---- Case 36: an existing person only has empty fields filled ----------------------------------------------------------------------------------------------------------------------------------------
 
@@ -1375,7 +1446,7 @@ class LeadsToAttioTests(unittest.TestCase):
         attio = PretendAttio()
         code, _ = self.live(outlook, attio, gemini)
         self.assertEqual(code, 0)
-        self.assertEqual(len(gemini.calls), 1)
+        self.assertEqual(len(gemini.calls), 0)
         for request in outlook.requests:
             self.assertNotIn("inbox/messages", request.full_url)
             self.assertNotIn("processed-id/messages", request.full_url)
@@ -1439,7 +1510,7 @@ class LeadsToAttioTests(unittest.TestCase):
         code, output = self.live(outlook, attio, gemini, "--only-subject", "Demo request",
                                  "--only-from", "jo@nautspace.example")
         self.assertEqual(code, 0)
-        self.assertEqual(len(gemini.calls), 1, "only the email matching both filters may go to Gemini")
+        self.assertEqual(len(gemini.calls), 0)
         self.assertEqual([outlook.where(i) for i in ("n1", "o1", "n2")], ["processed", "leads", "leads"])
         self.assertEqual(list(self.state()["emails"]), ["n1"])
         self.assertEqual(attio.person_ids("pat.other@gmail.com"), [])
@@ -1452,7 +1523,7 @@ class LeadsToAttioTests(unittest.TestCase):
                 outlook, attio, gemini = self.only_from_world()
                 code, output = self.live(outlook, attio, gemini, "--only-from", address)
                 self.assertEqual(code, 0)
-                self.assertEqual(len(gemini.calls), 2)
+                self.assertEqual(len(gemini.calls), 0)
                 self.assertEqual([outlook.where(i) for i in ("n1", "o1", "n2")], ["processed", "leads", "processed"])
                 self.assertEqual(sorted(self.state()["emails"]), ["n1", "n2"])
 
@@ -1494,7 +1565,7 @@ class LeadsToAttioTests(unittest.TestCase):
         self.assertEqual(output.count("Email: "), 1)
         self.assertIn("Email: jo@nautspace.example, Demo request", output)
         self.assertIn("1 lead(s) would be handled", output)
-        self.assertEqual(len(gemini.calls), 1)
+        self.assertEqual(len(gemini.calls), 0)
         self.assertEqual(attio.writes(), [])
         self.assertEqual(outlook.changes(), [])
         self.assertFalse(self.state_path.exists())
@@ -1511,7 +1582,7 @@ class LeadsToAttioTests(unittest.TestCase):
         self.assertIn("Skipped (system or security email): Your verification code", output)
         self.assertNotIn("Needs a person", output)
         self.assertEqual(outlook.where("s1"), "leads")
-        self.assertEqual(len(gemini.calls), calls + 1, "only the one new email from that sender (n2) goes to Gemini")
+        self.assertEqual(len(gemini.calls), calls)
 
     def only_subject_world(self):
         outlook = PretendOutlook(leads=[
@@ -1530,7 +1601,7 @@ class LeadsToAttioTests(unittest.TestCase):
         outlook, attio, gemini = self.only_subject_world()
         code, _ = self.live(outlook, attio, gemini, "--only-subject", "ATTIO-TEST")
         self.assertEqual(code, 0)
-        self.assertEqual(len(gemini.calls), 2)
+        self.assertEqual(len(gemini.calls), 0)
         self.assertEqual([outlook.where(i) for i in ("t1", "t2", "x1")], ["processed", "processed", "leads"])
         self.assertEqual(attio.person_ids("ben@maple.example"), [])
         self.assertNotIn("x1", json.dumps(self.state()))
@@ -1539,7 +1610,7 @@ class LeadsToAttioTests(unittest.TestCase):
         outlook, attio, gemini = self.only_subject_world()
         code, output = self.dry(outlook, attio, gemini, "--only-subject", "ATTIO-TEST")
         self.assertEqual(code, 0)
-        self.assertEqual(len(gemini.calls), 2)
+        self.assertEqual(len(gemini.calls), 0)
         self.assertNotIn("Real customer", output)
         self.assertEqual(attio.writes(), [])
 
@@ -1639,14 +1710,14 @@ class LeadsToAttioTests(unittest.TestCase):
         outlook.urlopen = twice
         code, output = self.dry(outlook, attio, gemini)
         self.assertEqual(code, 0)
-        self.assertEqual(len(gemini.calls), 1)
+        self.assertEqual(len(gemini.calls), 0)
         self.assertEqual(output.count("would create deal"), 1)
 
     # ---- Case 43 ----
 
-    def test_case43_a_dry_run_needs_every_key_and_the_owner(self):
+    def test_case43_a_dry_run_needs_the_attio_key_and_the_owner(self):
+        # (no Gemini key is needed any more: see test_case35_no_gemini_key_prompt_or_model_is_needed)
         for name, expected in (("ATTIO_API_KEY", "I can't find ATTIO_API_KEY"),
-                               ("GEMINI_API_KEY", "I can't find GEMINI_API_KEY"),
                                ("ATTIO_DEAL_OWNER", "I can't find ATTIO_DEAL_OWNER")):
             with self.subTest(setting=name):
                 outlook, attio, gemini = self.one_lead()
@@ -1703,7 +1774,7 @@ class LeadsToAttioTests(unittest.TestCase):
         self.assertIn("Already handled earlier", output)
         self.assertEqual(output.count("would create deal"), 1)
         self.assertIn("3 still waiting", output)
-        self.assertEqual(len(gemini.calls), calls + 1)
+        self.assertEqual(len(gemini.calls), calls)
         self.assertEqual(self.state_path.read_bytes(), before, "a dry run must not change the state file")
 
     # ---- Case 45: Outlook sign-in expired or Outlook unreachable ------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1922,7 +1993,7 @@ class LeadsToAttioTests(unittest.TestCase):
                 self.assertIn("Skipped (system or security email): Your verification code", output)
                 self.assertIn("Skipped (system or security email): Hello", output)
                 self.assertIn("System or security emails skipped: 2", output)
-                self.assertEqual(len(gemini.calls), 1)
+                self.assertEqual(len(gemini.calls), 0)
                 self.assertNotIn("Email: noreply@example.com", output)
                 self.assertNotIn("Needs a person", output)
                 self.assertEqual(outlook.where("s1"), "leads")
@@ -1942,7 +2013,7 @@ class LeadsToAttioTests(unittest.TestCase):
                 attio = PretendAttio()
                 code, output = self.live(outlook, attio, gemini)
                 self.assertEqual(code, 0)
-                self.assertEqual(len(gemini.calls), 1)
+                self.assertEqual(len(gemini.calls), 0)
                 self.assertEqual(outlook.where("m1"), "processed")
                 self.assertIn("System or security emails skipped: 0", output)
                 self.assertNotIn("Skipped (system or security email)", output)
@@ -1958,7 +2029,7 @@ class LeadsToAttioTests(unittest.TestCase):
                 attio = PretendAttio()
                 code, output = self.live(outlook, attio, gemini)
                 self.assertEqual(code, 0)
-                self.assertEqual(len(gemini.calls), 1)
+                self.assertEqual(len(gemini.calls), 0)
                 self.assertIn("System or security emails skipped: 0", output)
 
     def test_case52_skipped_emails_do_not_use_up_the_maximum(self):
@@ -2001,110 +2072,57 @@ class LeadsToAttioTests(unittest.TestCase):
         self.assertIn("System or security emails skipped: 0", output)
         self.assertEqual(len(gemini.calls), calls)
 
-    # ---- Cases 57 to 61: emails the triage already confirmed as leads -------------------------------------------------
+    # ---- Cases 57 to 61 (replaced): the saved answer is what the Attio step uses --------------------------------
+    # (tests/cases/11-single-call-pipeline.md, Part B: Cases A1 to A3, A6 to A8)
 
-    CONFIRMED_NOTE = "already been confirmed as a genuine lead"
-
-    def write_triage_state(self, entries):
-        self.triage_state_path.write_text(json.dumps({"version": 1, "emails": entries}), encoding="utf-8")
-
-    def triage_entry(self, outcome="Lead - Demo", internet_id="<m1@test.example>"):
-        entry = {"outcome": outcome, "stage": "done", "urgency": 1, "date": "2026-10-20"}
-        if internet_id:
-            entry["internet_message_id"] = internet_id
-        return entry
-
-    def test_case57_a_triage_confirmed_lead_ignores_geminis_is_lead_answer(self):
-        # The triage recorded the email under its old Outlook ID; its message ID is what matches.
-        self.write_triage_state({"old-outlook-id": self.triage_entry("Lead - Demo")})
-        outlook, attio, gemini = self.one_lead("Demo please", info(is_lead=False))
+    def test_case57_the_saved_answer_is_read_from_the_email_and_gemini_is_never_called(self):
+        outlook, attio, gemini = self.one_lead("Demo please", info())
         code, output = self.live(outlook, attio, gemini)
         self.assertEqual(code, 0)
-        self.assertIn("confirmed as a lead by the triage", output)
-        self.assertNotIn("Needs a person", output)
-        self.assertEqual(outlook.where("m1"), "processed")
+        self.assertEqual(gemini.calls, [])
+        reads = [r for r in outlook.requests if "/extensions/" in r.full_url]
+        self.assertEqual(len(reads), 1)
+        self.assertTrue(reads[0].full_url.endswith("/me/messages/m1/extensions/" + EXTENSION_NAME))
+        self.assertNotIn("?", reads[0].full_url)
         self.assertEqual(attio.counts(), (1, 1, 1, 1))
-        self.assertIn(self.CONFIRMED_NOTE, gemini.calls[0]["text"])
+        self.assertEqual(outlook.where("m1"), "processed")
 
-    def test_case57_all_three_lead_categories_are_trusted(self):
-        for outcome in ("Lead - Demo", "Lead - Pricing", "Lead - Other"):
-            with self.subTest(outcome=outcome):
-                self.state_path.unlink(missing_ok=True)
-                self.write_triage_state({"x": self.triage_entry(outcome)})
-                outlook, attio, gemini = self.one_lead("Demo please", info(is_lead=False))
-                code, _ = self.live(outlook, attio, gemini)
-                self.assertEqual(code, 0)
-                self.assertEqual(outlook.where("m1"), "processed")
-
-    def test_case57_a_dry_run_trusts_the_triage_too(self):
-        self.write_triage_state({"x": self.triage_entry("Lead - Pricing")})
-        outlook, attio, gemini = self.one_lead("Demo please", info(is_lead=False))
+    def test_case57_a_dry_run_uses_the_saved_answer_too(self):
+        outlook, attio, gemini = self.one_lead("Demo please", info())
         code, output = self.dry(outlook, attio, gemini)
         self.assertEqual(code, 0)
-        self.assertIn("confirmed as a lead by the triage", output)
         self.assertIn("would create deal", output)
         self.assertEqual(attio.writes(), [])
+        self.assertEqual(gemini.calls, [])
 
-    def test_case58_unconfirmed_emails_keep_the_normal_check(self):
-        cases = {
-            "no record": {},
-            "triage said not a lead": {"x": self.triage_entry("Not a lead")},
-            "triage said needs review": {"x": self.triage_entry("Needs review")},
-            "record without a message id": {"x": self.triage_entry("Lead - Demo", internet_id=None)},
-        }
-        for name, entries in cases.items():
-            with self.subTest(case=name):
-                self.state_path.unlink(missing_ok=True)
-                self.write_triage_state(entries)
-                outlook, attio, gemini = self.one_lead("Demo please", json.dumps({"is_lead": False}))
-                code, output = self.live(outlook, attio, gemini)
-                self.assertEqual(code, 0)
-                self.assertIn("Needs a person", output)
-                self.assertEqual(attio.counts(), (0, 0, 0, 0))
-                self.assertNotIn(self.CONFIRMED_NOTE, gemini.calls[0]["text"])
-                self.assertNotIn("confirmed as a lead by the triage", output)
-
-    def test_case59_the_message_id_matches_not_the_outlook_folder_id(self):
-        # Same Outlook ID as the email in Leads, but a different message ID: not the same email.
-        self.write_triage_state({"m1": self.triage_entry("Lead - Demo", internet_id="<different@test.example>")})
-        outlook, attio, gemini = self.one_lead("Demo please", json.dumps({"is_lead": False}))
+    def test_case58_no_saved_answer_means_needs_a_person_and_is_not_asked_about_again(self):
+        outlook = PretendOutlook(leads=[lead_msg("m1", "Old lead")])
+        attio, gemini = PretendAttio(), PretendGemini()
         code, output = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
         self.assertIn("Needs a person", output)
+        self.assertIn("no usable answer was saved on the email", output)
         self.assertEqual(attio.counts(), (0, 0, 0, 0))
+        self.assertEqual(outlook.where("m1"), "leads")
+        self.assertEqual(outlook.changes(), [])
+        self.assertEqual(self.state()["emails"]["m1"]["status"], "attention")
+        reads_before = len([r for r in outlook.requests if "/extensions/" in r.full_url])
+        code, output = self.live(outlook, attio, gemini)
+        self.assertIn("Still needs a person", output)
+        reads_after = len([r for r in outlook.requests if "/extensions/" in r.full_url])
+        self.assertEqual(reads_after, reads_before, "a normal run does not look at it again")
+        self.assertEqual(gemini.calls, [])
 
-    def test_case59_the_list_request_asks_outlook_for_the_message_id(self):
-        outlook, attio, gemini = self.one_lead()
-        self.dry(outlook, attio, gemini)
-        listing = [r for r in outlook.requests if r.full_url.split("?")[0].endswith("/leads-id/messages")]
-        self.assertTrue(listing)
-        self.assertTrue(all("internetMessageId" in r.full_url for r in listing))
-
-    def test_case60_a_missing_or_damaged_triage_file_trusts_nothing_and_is_never_changed(self):
-        for content in (None, "", "{ not valid json", json.dumps({"emails": 5}), json.dumps([1, 2])):
-            for argv in (["--live"], []):
-                with self.subTest(content=content, argv=argv):
-                    self.state_path.unlink(missing_ok=True)
-                    self.triage_state_path.unlink(missing_ok=True)
-                    if content is not None:
-                        self.triage_state_path.write_text(content, encoding="utf-8")
-                    before = self.triage_state_path.read_bytes() if self.triage_state_path.exists() else None
-                    outlook, attio, gemini = self.one_lead("Demo please", json.dumps({"is_lead": False}))
-                    code, output = self.run_main(outlook, attio, gemini, argv)
-                    self.assertEqual(code, 0)
-                    self.assertIn("Needs a person", output)
-                    after = self.triage_state_path.read_bytes() if self.triage_state_path.exists() else None
-                    self.assertEqual(before, after, "the triage state file must never be changed or created")
-
-    def test_case61_a_trusted_email_with_unreadable_details_needs_a_person(self):
+    def test_case58_unusable_saved_answers_need_a_person_with_the_reason_named(self):
         cases = [
-            ("broken reply", "Sorry, I can only chat about yoga.", "Gemini's reply could not be used"),
-            ("only is_lead", json.dumps({"is_lead": False}), "no usable email address"),
-            ("no address", info(is_lead=False, email="n/a"), "no usable email address"),
+            ("not a lead", info(is_lead=False), "the saved answer says it is not a lead"),
+            ("needs review", info(request_type="complaint"), "the saved answer says it needs review"),
+            ("damaged", "this is not json", "no usable answer was saved on the email"),
+            ("no address", info(email="n/a"), "no usable email address"),
         ]
         for name, reply, reason in cases:
             with self.subTest(case=name):
                 self.state_path.unlink(missing_ok=True)
-                self.write_triage_state({"x": self.triage_entry("Lead - Demo")})
                 outlook, attio, gemini = self.one_lead("Demo please", reply)
                 code, output = self.live(outlook, attio, gemini)
                 self.assertEqual(code, 0)
@@ -2113,63 +2131,151 @@ class LeadsToAttioTests(unittest.TestCase):
                 self.assertEqual(attio.counts(), (0, 0, 0, 0))
                 self.assertEqual(outlook.where("m1"), "leads")
 
-    def test_case61_the_request_type_falls_back_to_the_triage_category(self):
-        self.write_triage_state({"x": self.triage_entry("Lead - Pricing")})
-        outlook, attio, gemini = self.one_lead("Demo please", info(is_lead=False, request_type=None))
+    def test_case58_a_saved_answer_for_another_version_or_with_odd_fields_is_not_used(self):
+        outlook, attio, gemini = self.one_lead("Demo please", info())
+        outlook.extensions["m1"] = saved_extension(json.dumps({
+            "is_lead": True, "category": "Lead - Demo", "name": "Nora Fischer",
+            "email": "nora@brightwell.example", "request_type": "demo"}), version=2)
+        code, output = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn("Needs a person", output)
+        self.assertEqual(attio.counts(), (0, 0, 0, 0))
+
+    def test_case59_the_triage_state_file_is_no_longer_read(self):
+        self.assertFalse(hasattr(leads_to_attio, "load_triage_leads"))
+        # a triage file that says "not a lead" changes nothing: the saved answer decides
+        self.triage_state_path.write_text(json.dumps({"version": 1, "emails": {"x": {
+            "outcome": "Not a lead", "stage": "done", "internet_message_id": "<m1@test.example>"}}}), encoding="utf-8")
+        before = self.triage_state_path.read_bytes()
+        outlook, attio, gemini = self.one_lead("Demo please", info())
+        code, _ = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(attio.counts(), (1, 1, 1, 1))
+        self.assertEqual(self.triage_state_path.read_bytes(), before)
+
+    def test_case59_the_leads_list_asks_only_for_what_is_needed_and_never_the_body(self):
+        outlook, attio, gemini = self.one_lead()
+        self.dry(outlook, attio, gemini)
+        listing = [r for r in outlook.requests if r.full_url.split("?")[0].endswith("/leads-id/messages")]
+        self.assertTrue(listing)
+        for request in listing:
+            select = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)["$select"][0]
+            fields = select.split(",")
+            self.assertNotIn("body", fields)
+            self.assertNotIn("bodyPreview", fields)
+            self.assertIn("id", fields)
+            self.assertIn("subject", fields)
+            self.assertIn("from", fields)
+            self.assertNotIn("outlook.body-content-type", " ".join(request.headers.values()))
+
+    def test_case60_the_request_type_comes_from_the_saved_answer(self):
+        outlook, attio, gemini = self.one_lead("Demo please", info(request_type="pricing"))
+        self.live(outlook, attio, gemini)
+        (deal,) = attio.deals.values()
+        self.assertEqual(deal["name"], "Brightwell Gyms: pricing")
+
+    def test_case60_a_missing_request_type_falls_back_to_the_saved_category(self):
+        outlook, attio, gemini = self.one_lead("Demo please", info())
+        outlook.extensions["m1"] = saved_extension(json.dumps({
+            "is_lead": True, "category": "Lead - Pricing", "name": "Nora Fischer",
+            "email": "nora@brightwell.example", "company": "Brightwell Gyms", "role": None,
+            "request_type": None, "urgency": 1, "summary": "Asks about prices.", "draft_reply": None}))
         code, _ = self.live(outlook, attio, gemini)
         self.assertEqual(code, 0)
         (deal,) = attio.deals.values()
         self.assertEqual(deal["name"], "Brightwell Gyms: pricing")
 
-    def test_case61_geminis_own_valid_request_type_wins(self):
-        self.write_triage_state({"x": self.triage_entry("Lead - Pricing")})
-        outlook, attio, gemini = self.one_lead("Demo please", info(request_type="demo"))
+    def test_case61_the_state_file_holds_no_lead_details(self):
+        reply = info(name="NAME-MARKER-PERSON", email="marker.person@brightwell.example",
+                     company="COMPANY-MARKER-CO", role="ROLE-MARKER-JOB", summary="SUMMARY-MARKER-TEXT")
+        outlook, attio, gemini = self.one_lead("Demo please", reply)
+        code, output = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(attio.counts(), (1, 1, 1, 1))
+        kept = self.saved_text()
+        for marker in ("NAME-MARKER-PERSON", "marker.person@brightwell.example", "COMPANY-MARKER-CO",
+                       "ROLE-MARKER-JOB", "SUMMARY-MARKER-TEXT"):
+            self.assertNotIn(marker, kept)
+        self.assertIn("SUMMARY-MARKER-TEXT", json.dumps(attio.notes))      # it did go to Attio
+
+    def test_case61_a_failure_part_way_keeps_no_lead_details_either_and_the_retry_works(self):
+        reply = info(name="NAME-MARKER-PERSON", summary="SUMMARY-MARKER-TEXT")
+        outlook, attio, gemini = self.one_lead("Demo please", reply)
+        attio.fail("POST", "/v2/objects/companies/records", Status(503, "overloaded"))
+        code, _ = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 1)
+        for marker in ("NAME-MARKER-PERSON", "SUMMARY-MARKER-TEXT"):
+            self.assertNotIn(marker, self.saved_text())
+        code, _ = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(attio.counts(), (1, 1, 1, 1))
+        self.assertEqual(outlook.where("m1"), "processed")
+
+    def test_case61_the_saved_answer_is_only_read_never_written_or_changed(self):
+        outlook, attio, gemini = self.one_lead()
         self.live(outlook, attio, gemini)
-        (deal,) = attio.deals.values()
-        self.assertEqual(deal["name"], "Brightwell Gyms: demo")
+        for request in outlook.changes():
+            self.assertTrue(request.full_url.endswith("/move"), "the only change is the move to Processed")
+        self.assertEqual(len(outlook.moves), 1)
+        self.assertEqual(outlook.moves[0][1], {"destinationId": "processed-id"})
 
-    # ---- Case 62: --retry-attention -------------------------------------------------------------------------------------
+    def test_case61_only_reads_and_the_move_are_ever_sent_to_outlook(self):
+        outlook, attio, gemini = self.one_lead()
+        self.live(outlook, attio, gemini)
+        for request in outlook.requests:
+            path = urllib.parse.urlparse(request.full_url).path.lower()
+            for word in ("/send", "/reply", "/forward", "/copy", "/createreply", "/permanentdelete"):
+                self.assertNotIn(word, path)
+            self.assertIn(request.get_method(), ("GET", "POST"))
+            if request.get_method() == "POST":
+                self.assertTrue(path.endswith("/move"))
 
-    NOT_A_LEAD = json.dumps({"is_lead": False})
+    # ---- Case 62 (replaced): --retry-attention looks at the saved answer again, without Gemini --------------------
+    # (tests/cases/11-single-call-pipeline.md, Part B: Case A4)
 
-    def test_case62_a_normal_run_leaves_it_and_retry_attention_asks_again(self):
-        outlook, attio, gemini = self.one_lead("Demo please", [self.NOT_A_LEAD, info()])
+    def mark_needs_a_person(self, outlook, attio, gemini):
+        """Run once with no saved answer on the email, so it is marked as needing a person."""
+        gemini.replies = {}
+        outlook.extensions.clear()
         self.live(outlook, attio, gemini)
         self.assertEqual(self.state()["emails"]["m1"]["status"], "attention")
-        calls = len(gemini.calls)
+
+    def test_case62_a_normal_run_leaves_it_and_retry_attention_reads_the_saved_answer_again(self):
+        outlook, attio, gemini = self.one_lead("Demo please", info())
+        self.mark_needs_a_person(outlook, attio, gemini)
+        outlook.extensions["m1"] = saved_from_reply(info())        # the answer is on the email now
 
         code, output = self.live(outlook, attio, gemini)
         self.assertIn("Still needs a person", output)
-        self.assertEqual(len(gemini.calls), calls, "a normal run must not ask again")
+        self.assertEqual(attio.counts(), (0, 0, 0, 0))
 
         code, output = self.live(outlook, attio, gemini, "--retry-attention")
         self.assertEqual(code, 0)
-        self.assertIn("asking Gemini again", output)
-        self.assertEqual(len(gemini.calls), calls + 1)
+        self.assertNotIn("Gemini", output)
         self.assertEqual(outlook.where("m1"), "processed")
         self.assertEqual(attio.counts(), (1, 1, 1, 1))
         self.assertEqual(self.state()["emails"]["m1"]["status"], "done")
+        self.assertEqual(gemini.calls, [])
 
     def test_case62_a_failed_retry_keeps_the_mark_with_the_new_reason(self):
-        outlook, attio, gemini = self.one_lead(
-            "Demo please", [self.NOT_A_LEAD, "Sorry, I can only chat about yoga."])
+        outlook, attio, gemini = self.one_lead("Demo please", info(is_lead=False))
         self.live(outlook, attio, gemini)
         self.assertIn("not a lead", self.state()["emails"]["m1"]["reason"])
+        outlook.extensions["m1"] = saved_extension("this is not json")
         code, output = self.live(outlook, attio, gemini, "--retry-attention")
         self.assertEqual(code, 0)
         self.assertEqual(outlook.where("m1"), "leads")
         self.assertEqual(self.state()["emails"]["m1"]["status"], "attention")
-        self.assertIn("could not be used", self.state()["emails"]["m1"]["reason"])
+        self.assertIn("usable", self.state()["emails"]["m1"]["reason"])
 
     def test_case62_it_never_touches_emails_that_are_already_done(self):
         outlook, attio, gemini = self.one_lead("Demo please", info())
         self.live(outlook, attio, gemini)
         outlook.add_lead(lead_msg("m1", "Demo please"))               # back in Leads, same id
-        calls, counts = len(gemini.calls), attio.counts()
+        counts = attio.counts()
         code, output = self.live(outlook, attio, gemini, "--retry-attention")
         self.assertEqual(code, 0)
         self.assertIn("Already handled earlier", output)
-        self.assertEqual(len(gemini.calls), calls)
         self.assertEqual(attio.counts(), counts)
 
     def test_case62_it_works_with_the_filters(self):
@@ -2177,22 +2283,20 @@ class LeadsToAttioTests(unittest.TestCase):
             lead_msg("a1", "First email", received="2026-10-20T08:00:00Z"),
             lead_msg("a2", "Second email", sender="omar@other.example", name="Omar", received="2026-10-20T09:00:00Z"),
         ])
-        gemini = PretendGemini({
-            "First email": [self.NOT_A_LEAD, info()],
-            "Second email": [self.NOT_A_LEAD, info(name="Omar", email="omar@other.example", company="Other Co")],
-        })
+        gemini = PretendGemini()
         attio = PretendAttio()
-        self.live(outlook, attio, gemini)                      # both marked "needs a person"
-        calls = len(gemini.calls)
+        self.live(outlook, attio, gemini)                      # nothing saved: both marked "needs a person"
+        outlook.extensions["a1"] = saved_from_reply(info())
+        outlook.extensions["a2"] = saved_from_reply(info(name="Omar", email="omar@other.example", company="Other Co"))
         code, output = self.live(outlook, attio, gemini, "--retry-attention", "--only-subject", "First")
         self.assertEqual(code, 0)
-        self.assertEqual(len(gemini.calls), calls + 1)
         self.assertEqual([outlook.where("a1"), outlook.where("a2")], ["processed", "leads"])
         self.assertEqual(self.state()["emails"]["a2"]["status"], "attention")
 
     def test_case62_a_dry_run_retries_without_changing_any_state(self):
-        outlook, attio, gemini = self.one_lead("Demo please", [self.NOT_A_LEAD, info()])
-        self.live(outlook, attio, gemini)
+        outlook, attio, gemini = self.one_lead("Demo please", info())
+        self.mark_needs_a_person(outlook, attio, gemini)
+        outlook.extensions["m1"] = saved_from_reply(info())
         before = self.state_path.read_bytes()
         code, output = self.dry(outlook, attio, gemini, "--retry-attention")
         self.assertEqual(code, 0)
@@ -2200,20 +2304,6 @@ class LeadsToAttioTests(unittest.TestCase):
         self.assertEqual(self.state_path.read_bytes(), before)
         self.assertEqual(attio.counts(), (0, 0, 0, 0))
         self.assertEqual(outlook.where("m1"), "leads")
-
-    def test_prompt_v2_and_the_config_model_are_used(self):
-        outlook, attio, gemini = self.one_lead()
-        self.live(outlook, attio, gemini)
-        self.assertIn("PROMPT-V2", gemini.calls[0]["text"])
-        self.assertIn("fake-model-a", gemini.calls[0]["url"])
-
-    def test_the_email_text_reaches_gemini(self):
-        outlook, attio, gemini = self.one_lead(body="I would like a demo")
-        self.live(outlook, attio, gemini)
-        sent = gemini.calls[0]["text"]
-        self.assertIn("nora@brightwell.example", sent)
-        self.assertIn("Subject: Demo please", sent)
-        self.assertIn("I would like a demo", sent)
 
 
 if __name__ == "__main__":

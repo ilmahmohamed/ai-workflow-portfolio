@@ -1,7 +1,9 @@
 """Send the emails in the Outlook Leads folder to Attio.
 
-For each email in the Leads folder it asks Gemini (prompt v2 by default) for the
-name, email, company, role, request type, urgency and summary. Then, in Attio, it:
+For each email in the Leads folder it reads the answer the triage saved on that email
+(name, email, company, role, request type, urgency and summary; see saved_results.py). It never
+asks Gemini and never reads the email's own text. An email with no usable saved answer is marked
+"needs a person" and left in Leads. Then, in Attio, it:
   1. finds or creates the person (one person per email address),
   2. finds or creates the company (one company per email domain; free-mail
      domains such as gmail.com get no company),
@@ -11,14 +13,16 @@ name, email, company, role, request type, urgency and summary. Then, in Attio, i
 When all of that worked, it moves the email to Leads/Processed. If anything fails
 the email stays in Leads and the next run carries on without duplicates.
 
-Dry run by default: it asks Gemini and looks things up in Attio (read only), then
+Dry run by default: it reads the saved answers and looks things up in Attio (read only), then
 prints exactly what it WOULD do. It writes nothing to Attio, moves no email and
 does not touch the state file. Add --live to really do it.
 
 Settings (in .env, never printed): ATTIO_API_KEY, ATTIO_DEAL_OWNER (the deal
-owner's email address in Attio), GEMINI_API_KEY, plus the Outlook sign-in.
-Progress is kept in leads-to-attio-state.json next to this script (git-ignored).
-It never deletes anything and never sends or replies to an email.
+owner's email address in Attio), plus the Outlook sign-in. No Gemini key is needed.
+Progress is kept in leads-to-attio-state.json next to this script (git-ignored). It holds only
+technical progress (ids, status, a short reference), never a lead's details.
+It never deletes anything and never sends, replies to, forwards or copies an email. The only change
+it asks Outlook for is moving a handled email to Leads/Processed.
 
 Run:  python workflows\\02-email-to-attio\\leads_to_attio.py
       python workflows\\02-email-to-attio\\leads_to_attio.py --live
@@ -45,13 +49,13 @@ HERE = Path(__file__).resolve().parent
 # The Outlook sign-in helpers live next door.
 sys.path.insert(0, str(HERE.parent / "01-outlook-to-slack"))
 
-import extract_leads  # noqa: E402
-from extract_leads import ask_gemini, build_message, get_api_key, load_model, load_prompt, parse_reply, read_env_value  # noqa: E402
+import saved_results  # noqa: E402
+import v3_reply  # noqa: E402
+from extract_leads import read_env_value  # noqa: E402
 from outlook_signin import SetupProblem as OutlookProblem  # noqa: E402
 from outlook_signin import get_client_id, read_env_text  # noqa: E402
 from outlook_to_slack import find_leads_folder, get_access_token  # noqa: E402
 # The system and security email rule is shared with the triage, not copied.
-import outlook_triage  # noqa: E402  (its state file tells us which emails the triage confirmed as leads)
 from outlook_triage import OutlookRefused, graph, is_system_email, parse_time, read_graph, sender_of, subject_of  # noqa: E402
 
 STATE_PATH = HERE / "leads-to-attio-state.json"
@@ -61,20 +65,13 @@ RETRY_WAIT_SECONDS = 2
 MAX_PER_RUN = 10
 MAX_PAGES = 10
 PAGE_SIZE = 50
-MAX_BODY_CHARS = 4000
 MAX_SUMMARY_CHARS = 2000
 MAX_NAME_CHARS = 150
-DEFAULT_PROMPT = "v2"
 STAGE_NAME = "New"
 REQUEST_TYPES = ("demo", "pricing", "partnership", "other")
-# What the triage's three lead categories mean here (used when Gemini gives no valid request type).
-TRUSTED_TYPES = {"Lead - Demo": "demo", "Lead - Pricing": "pricing", "Lead - Other": "other"}
-# Added to the prompt for an email the triage already confirmed as a lead.
-TRUSTED_NOTE = (
-    "\n\nNote: this email has already been confirmed as a genuine lead. "
-    "Do not decide whether it is a lead. Always reply with is_lead true and fill in "
-    "every field you can read from the email."
-)
+# What the three lead categories mean here (used when the saved answer has no valid request type).
+CATEGORY_TO_REQUEST = {"Lead - Demo": "demo", "Lead - Pricing": "pricing", "Lead - Other": "other"}
+NO_ANSWER = "no usable answer was saved on the email"
 
 FREE_MAIL_DOMAINS = frozenset({
     "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "yahoo.com",
@@ -107,7 +104,7 @@ class AttioRejected(AttioProblem):
         self.message = message
 
 
-PROBLEMS = (OutlookProblem, extract_leads.SetupProblem, AttioProblem)
+PROBLEMS = (OutlookProblem, saved_results.SavedResultProblem, AttioProblem)
 
 
 # ---- Small helpers --------------------------------------------------------------
@@ -327,26 +324,19 @@ def list_leads(token, leads_id):
     """The emails directly in the Leads folder, oldest first."""
     params = {
         "$orderby": "receivedDateTime asc",
-        "$select": "id,subject,from,receivedDateTime,body,internetMessageId",
+        "$select": "id,subject,from,receivedDateTime",
         "$top": str(PAGE_SIZE),
     }
     target = f"/me/mailFolders/{urllib.parse.quote(leads_id, safe='')}/messages"
     messages = []
     for _ in range(MAX_PAGES):
-        data = read_graph(token, target, params, text_body=True)
+        data = read_graph(token, target, params)
         messages.extend(data.get("value", []))
         next_link = data.get("@odata.nextLink")
         if not next_link or not next_link.startswith("https://graph.microsoft.com/"):
             break
         target, params = next_link, None
     return messages
-
-
-def email_text(message):
-    address, name = sender_of(message)
-    from_line = f"{name} <{address}>" if name and name != address else address
-    body = ((message.get("body") or {}).get("content")) or ""
-    return f"From: {from_line}\nSubject: {subject_of(message)}\nBody:\n{body[:MAX_BODY_CHARS]}"
 
 
 def move_email(token, message, processed_id):
@@ -400,59 +390,41 @@ def save_state(state):
     os.replace(temp, STATE_PATH)
 
 
-# ---- Reading Gemini's answer -------------------------------------------------------------
+# ---- Reading the saved answer -------------------------------------------------------------
 
-def load_triage_leads():
-    """The emails the triage confirmed as leads: {message ID: request type}. Read only, never raises.
-
-    Keyed by the email's own Message-ID header, because the Outlook ID changes when the triage
-    moves the email into Leads. A missing or damaged triage file simply trusts nothing.
-    """
-    try:
-        data = json.loads(outlook_triage.STATE_PATH.read_text(encoding="utf-8"))
-        confirmed = {}
-        for record in data["emails"].values():
-            request_type = TRUSTED_TYPES.get(record.get("outcome"))
-            message_id = record.get("internet_message_id")
-            if request_type and message_id:
-                confirmed[message_id] = request_type
-        return confirmed
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return {}
-
-
-def read_lead(parsed, trusted_type=None):
-    """Turn Gemini's answer into (lead, reason). lead is None when a person must look.
-
-    When the triage already confirmed the email as a lead, trusted_type is its request type:
-    Gemini's is_lead answer is then ignored and Gemini is only used to read the details.
-    """
-    if parsed is None:
-        return None, "Gemini's reply could not be used"
-    if trusted_type is None:
-        flag = parsed.get("is_lead")
-        if flag is False:
-            return None, "Gemini says it is not a lead"
-        if flag is not True:
-            return None, "Gemini's reply could not be used"
-    email = clean_text(parsed.get("email"))
+def read_lead(answer):
+    """Turn the answer saved on the email into (lead, reason). lead is None when a person must look."""
+    category = answer.get("category")
+    if category == v3_reply.NEEDS_REVIEW:
+        return None, "the saved answer says it needs review"
+    if answer.get("is_lead") is not True or category not in v3_reply.LEAD_CATEGORIES:
+        return None, "the saved answer says it is not a lead"
+    email = clean_text(answer.get("email"))
     email = email.lower() if email else None
     if not email or not EMAIL_SHAPE.match(email):
         return None, "no usable email address"
-    request_type = clean_text(parsed.get("request_type"))
+    request_type = clean_text(answer.get("request_type"))
     request_type = request_type.lower() if request_type else None
     if request_type not in REQUEST_TYPES:
-        request_type = trusted_type or "other"
-    urgency = parsed.get("urgency")
+        request_type = CATEGORY_TO_REQUEST[category]
+    urgency = answer.get("urgency")
     return {
-        "name": clean_text(parsed.get("name")),
+        "name": clean_text(answer.get("name")),
         "email": email,
-        "company": clean_text(parsed.get("company")),
-        "role": clean_text(parsed.get("role")),
+        "company": clean_text(answer.get("company")),
+        "role": clean_text(answer.get("role")),
         "request_type": request_type,
         "urgency": urgency if isinstance(urgency, int) and not isinstance(urgency, bool) else None,
-        "summary": clean_text(parsed.get("summary")) or "(no summary)",
+        "summary": clean_text(answer.get("summary")) or "(no summary)",
     }, None
+
+
+def lead_of(token, message_id):
+    """Read the saved answer on an email. Returns (lead, reason); a problem with Outlook is raised."""
+    answer = saved_results.load_result(token, message_id)
+    if answer is None:
+        return None, NO_ANSWER
+    return read_lead(answer)
 
 
 # ---- Doing the work (live) or planning it (dry run) ----------------------------------------
@@ -541,7 +513,7 @@ class Worker:
         """Find or create the company for the email domain. Free-mail gets none."""
         domain = company_domain(lead["email"])
         if domain in FREE_MAIL_DOMAINS:
-            entry["company_id"], entry["company_name"] = None, None
+            entry["company_id"] = None
             say("  no company: free-mail domain")
             return None
         found = self.plan_companies.get(domain) or self.client.find_company(domain)
@@ -564,7 +536,7 @@ class Worker:
                 company = {"id": company_id, "name": name}
             if not self.live:
                 self.plan_companies[domain] = company
-        entry["company_id"], entry["company_name"] = company["id"], company["name"]
+        entry["company_id"] = company["id"]
         if entry.get("person_new") and not entry.get("person_linked") and self.live:
             self.client.update_person(entry["person_id"], {"company": [
                 {"target_object": "companies", "target_record_id": company["id"]}]})
@@ -675,19 +647,10 @@ def check_settings():
             "I can't find ATTIO_DEAL_OWNER. Add the deal owner's email address (as in Attio) "
             "to your .env file and try again."
         )
-    return attio_key, owner, get_api_key()
+    return attio_key, owner
 
 
-def ask_for_lead(model, gemini_key, prompt, message, asked, trusted_type=None):
-    if asked:
-        time.sleep(extract_leads.PAUSE_SECONDS)
-    if trusted_type:
-        prompt = prompt.rstrip() + TRUSTED_NOTE
-    raw = ask_gemini(model, gemini_key, build_message(prompt, email_text(message)))
-    return read_lead(parse_reply(raw), trusted_type)
-
-
-def run(live, only_subject, prompt_version, only_from=None, retry_attention=False):
+def run(live, only_subject, only_from=None, retry_attention=False):
     if only_subject is not None and not only_subject.strip():
         raise AttioProblem(
             "The --only-subject text must not be empty, because empty text would match every email."
@@ -696,11 +659,9 @@ def run(live, only_subject, prompt_version, only_from=None, retry_attention=Fals
         raise AttioProblem(
             "The --only-from address must not be empty, because empty text would match every email."
         )
-    attio_key, owner_email, gemini_key = check_settings()
+    attio_key, owner_email = check_settings()
     env_text, _ = read_env_text()
     client_id = get_client_id(env_text)
-    model = load_model()
-    prompt = load_prompt(prompt_version)
     token = get_access_token(env_text, client_id)
 
     leads_id = find_leads_folder(token)
@@ -716,7 +677,6 @@ def run(live, only_subject, prompt_version, only_from=None, retry_attention=Fals
             f"I couldn't find the stage {STAGE_NAME} in the Attio Deals list. Check the stage names in Attio."
         )
     say("Dry run: nothing will be written to Attio or Outlook." if not live else "LIVE: updating Attio and moving emails.")
-    say(f"Prompt version: {prompt_version}; model: {model}")
     say("Deal owner found in Attio: yes")
 
     state, note = load_state(live)
@@ -725,7 +685,6 @@ def run(live, only_subject, prompt_version, only_from=None, retry_attention=Fals
 
     needle = only_subject.strip().lower() if only_subject is not None else None
     wanted_from = only_from.strip().lower() if only_from is not None else None
-    confirmed_by_triage = load_triage_leads()
     messages = list_leads(token, leads_id)
     messages.sort(key=lambda m: (parse_time(m.get("receivedDateTime")) or datetime.datetime.min.replace(
         tzinfo=datetime.timezone.utc), m.get("id", "")))
@@ -749,7 +708,7 @@ def run(live, only_subject, prompt_version, only_from=None, retry_attention=Fals
             say(f"Still needs a person: {subject_of(message)} ({entry.get('reason', 'see earlier note')})")
             left += 1
         elif is_system_email(message):
-            system.append(message)      # judged by sender and subject only; never sent to Gemini
+            system.append(message)      # judged by sender and subject only
         else:
             waiting_list.append(message)
 
@@ -774,35 +733,29 @@ def run(live, only_subject, prompt_version, only_from=None, retry_attention=Fals
     waiting = max(0, len(waiting_list) - MAX_PER_RUN)
     batch = waiting_list[:MAX_PER_RUN]
     worker = Worker(client, token, owner_id, stage, processed_id, state, live)
-    handled, asked = 0, 0
+    handled = 0
     try:
         for message in batch:
             address, _ = sender_of(message)
             say(f"Email: {address}, {subject_of(message)}")
             message_id = message["id"]
             entry = state["emails"].get(message_id) or {}
-            lead = entry.get("lead")
-            trusted_type = confirmed_by_triage.get(message.get("internetMessageId") or "")
-            if trusted_type:
-                say("  already confirmed as a lead by the triage: using Gemini only to read the details")
-            if not lead:
-                if entry.get("status") == "attention":
-                    say("  asking Gemini again (it was marked as needing a person)")
-                lead, reason = ask_for_lead(model, gemini_key, prompt, message, asked, trusted_type)
-                asked += 1
-                if lead is None:
-                    say(f"  Needs a person to look at it: {subject_of(message)} ({reason})")
-                    if live:
-                        state["emails"][message_id] = {"status": "attention", "reason": reason}
-                        save_state(state)
-                    left += 1
-                    continue
-                entry = {"status": "in_progress", "lead": lead, "ref": email_reference(message_id)}
+            # The saved answer is read from the email every time; it is never copied into the state file.
+            lead, reason = lead_of(token, message_id)
+            if lead is None:
+                say(f"  Needs a person to look at it: {subject_of(message)} ({reason})")
+                if live:
+                    state["emails"][message_id] = {"status": "attention", "reason": reason}
+                    save_state(state)
+                left += 1
+                continue
+            if entry.get("status") == "in_progress":
+                entry["ref"] = entry.get("ref") or email_reference(message_id)     # carry on where it stopped
+            else:
+                entry = {"status": "in_progress", "ref": email_reference(message_id)}
                 if live:
                     state["emails"][message_id] = entry
                     save_state(state)
-            else:
-                entry["ref"] = entry.get("ref") or email_reference(message_id)
             if not live:
                 entry = {"ref": email_reference(message_id)}
             worker.handle(message, lead, entry)
@@ -837,15 +790,14 @@ def main():
     sys.stdout.reconfigure(errors="replace")
     parser = argparse.ArgumentParser(description="Send the Outlook Leads folder to Attio.")
     parser.add_argument("--live", action="store_true", help="really write to Attio and move emails (default is a dry run)")
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help=f"prompt version (default {DEFAULT_PROMPT})")
     parser.add_argument("--only-subject", metavar="TEXT", help="only handle emails whose subject contains TEXT")
     parser.add_argument("--only-from", metavar="ADDRESS",
                         help="only handle emails from exactly this sender address (use with --only-subject to narrow further)")
     parser.add_argument("--retry-attention", action="store_true",
-                        help="ask Gemini again about emails marked as needing a person")
+                        help="read the saved answer again for emails marked as needing a person")
     args = parser.parse_args()
     try:
-        return run(args.live, args.only_subject, args.prompt, args.only_from, args.retry_attention)
+        return run(args.live, args.only_subject, args.only_from, args.retry_attention)
     except PROBLEMS as problem:
         print(problem)
         return 1
