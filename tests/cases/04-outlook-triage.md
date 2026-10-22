@@ -205,7 +205,7 @@ Some expected results depend on the "Decisions for Ilmah" at the end of this fil
 ## Case 31: system or security senders are skipped
 
 - Input: new emails whose sender address, in the part before the @, contains noreply, no-reply, do-not-reply, donotreply, accountprotection or security, in any capitals. For example "noreply@example.com", "do-not-reply@something.com" or "Security-Team@example.com".
-- Expected: each one is skipped. It gets no category, is not moved, has no state entry, and is never sent to Gemini.
+- Expected: each one is skipped. It gets no category, is not moved, has no record as a handled email, and is never sent to Gemini.
 - Expected: only the part before the @ is checked, and the sender's display name is not checked (see Cases 41 and 42).
 
 ## Case 32: system domains are skipped
@@ -223,13 +223,13 @@ Some expected results depend on the "Decisions for Ilmah" at the end of this fil
 ## Case 34: a skipped email is left completely untouched
 
 - Input: any skipped email, with or without categories of its own.
-- Expected: no category is added, it is not moved, nothing is written to the state file, no change request of any kind is sent to Outlook, and Gemini is not called.
+- Expected: no category is added, it is not moved, it gets no record among the handled emails in the state file, no change request of any kind is sent to Outlook, and Gemini is not called. (The triage only notes, in a separate list, that it has already reported the email. See Case 44.)
 - Expected: it stays in the Inbox, and on later runs it is skipped again in the same way.
 
 ## Case 35: each skipped email is reported and counted
 
 - Input: a run with two skipped emails and one ordinary email, once live and once as a dry run.
-- Expected: one plain line for each skipped email: "Skipped (system or security email): <subject>".
+- Expected: one plain line for each skipped email the first time it is seen: "Skipped (system or security email): <subject>". Later runs do not repeat it (see Case 44).
 - Expected: the final report counts them, for example "System or security emails skipped: 2". The count is also shown when every email was skipped, and in a dry run.
 - Expected: in a dry run, skipped emails are not listed as "would send to Gemini".
 
@@ -284,6 +284,22 @@ Some expected results depend on the "Decisions for Ilmah" at the end of this fil
 - Expected: the message ID is only an identifier. No email text is saved.
 - Input: an email with no message ID, or a state file from before this change.
 - Expected: nothing breaks. The record simply has no message ID, and older records keep working as before.
+
+## Case 44: a system or security email is reported once, not on every run
+
+- Input: a live run that skips a system email, then the same run again with the email still in the Inbox.
+- Expected: the first run prints "Skipped (system or security email): <subject>". The second run does not print it again.
+- Expected: the final count still includes it and says how many were reported earlier, for example "System or security emails skipped: 1 (1 already reported earlier)".
+- Expected: a new system email that arrives later is reported once, the first time it is seen.
+- Expected: the email itself stays completely untouched: no category, not moved, not sent to Gemini, and no record among the handled emails.
+- Input: a dry run.
+- Expected: it hides emails already reported and shows new ones, exactly as a live run would, but it never changes the state file.
+
+## Case 45: the memory of reported system emails stays small
+
+- Input: the state file remembers reported system emails by date, and some of those dates are old (more than two lookback periods ago).
+- Expected: the old ones are forgotten the next time a live run saves the state file, and recent ones are kept.
+- Expected: a state file from before this change (without the list) works as before, and the list is simply created when needed.
 
 ## Default behaviour
 

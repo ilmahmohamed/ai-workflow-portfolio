@@ -350,11 +350,34 @@ def dry_run(model, prompt_version, eligible, skipped, waiting):
     return 0
 
 
-def print_system_count(count):
-    print(f"System or security emails skipped: {count}")
+def print_system_count(count, already=0):
+    suffix = f" ({already} already reported earlier)" if already else ""
+    print(f"System or security emails skipped: {count}{suffix}")
 
 
-def live_run(token, key, model, prompt, state, eligible, skipped, waiting, system_count):
+def remember_system_emails(state, new_system):
+    """Note which system emails have been reported, so later runs do not print them again.
+
+    This is a separate list in the state file, never an entry among the handled emails, and the
+    emails themselves stay completely untouched. Old notes are forgotten so the list stays small.
+    """
+    reported = state.get("system_skipped")
+    if not isinstance(reported, dict):
+        reported = state["system_skipped"] = {}
+    today = now().date()
+    changed = False
+    for message in new_system:
+        reported[message["id"]] = today.isoformat()
+        changed = True
+    cutoff = (today - datetime.timedelta(days=2 * LOOKBACK_DAYS)).isoformat()
+    for message_id in [i for i, date in reported.items() if str(date) < cutoff]:
+        del reported[message_id]
+        changed = True
+    if changed:
+        save_state(state)
+
+
+def live_run(token, key, model, prompt, state, eligible, skipped, waiting, system_count, system_already=0):
     leads_id = find_leads_folder(token)   # stops here, before any change, if there is no Leads folder
     counts = {}
     broken = 0
@@ -400,7 +423,7 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
         if counts.get(category):
             print(f"  {category}: {counts[category]}")
     print(f"Skipped (already handled or already tagged): {skipped}")
-    print_system_count(system_count)
+    print_system_count(system_count, system_already)
     print(f"Broken replies: {broken}")
     if waiting:
         print(f"{waiting} still waiting for the next run.")
@@ -428,23 +451,30 @@ def run(live, only_subject, prompt_version):
     waiting = max(0, len(eligible) - MAX_PER_RUN)
     eligible = eligible[:MAX_PER_RUN]
 
-    # System and security emails are reported and left completely untouched.
-    for message in system:
+    # System and security emails are left completely untouched. Each is reported once, the first time
+    # it is seen. Those reported on an earlier run are only counted, so the log stays quiet.
+    reported_before = state.get("system_skipped")
+    reported_before = reported_before if isinstance(reported_before, dict) else {}
+    new_system = [m for m in system if m["id"] not in reported_before]
+    for message in new_system:
         print(f"Skipped (system or security email): {subject_of(message)}")
+    system_already = len(system) - len(new_system)
+    if live:
+        remember_system_emails(state, new_system)
 
     if not eligible:
         if only_subject is not None and not system:
             print(f'No new email with "{only_subject.strip()}" in the subject was found. Nothing was changed.')
         else:
             print(f"No new emails to handle. Skipped {skipped} that were already handled or tagged.")
-        print_system_count(len(system))
+        print_system_count(len(system), system_already)
         return 0
 
     if not live:
         code = dry_run(model, prompt_version, eligible, skipped, waiting)
-        print_system_count(len(system))
+        print_system_count(len(system), system_already)
         return code
-    return live_run(token, key, model, prompt, state, eligible, skipped, waiting, len(system))
+    return live_run(token, key, model, prompt, state, eligible, skipped, waiting, len(system), system_already)
 
 
 def main():

@@ -919,7 +919,9 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(gemini.calls, [], "a system email was sent to Gemini")
         self.assertEqual(outlook.changes(), [])
-        self.assertFalse(self.state_path.exists())
+        # It gets no record among the handled emails (the state file may note that it was reported).
+        if self.state_path.exists():
+            self.assertNotIn(message["id"], self.state()["emails"])
         self.assertEqual(outlook.where(message["id"]), "inbox")
         self.assertEqual(outlook.categories(message["id"]), message["categories"])
         self.assertIn(f"Skipped (system or security email): {message['subject']}", output)
@@ -1155,6 +1157,89 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("old", self.state()["emails"])
         self.assertEqual(self.state()["emails"]["m1"]["internet_message_id"], "<n@mail.test.example>")
+
+    # ---- Cases 44 and 45: a system email is reported once, not on every run ------------------
+
+    def system_inbox(self):
+        return PretendOutlook([
+            msg("s1", "Your verification code", sender="noreply@example.com", received="2026-10-20T07:00:00Z"),
+            msg("n1", "Weekly newsletter", received="2026-10-20T09:00:00Z"),
+        ])
+
+    def test_case44_a_system_email_is_reported_only_the_first_time(self):
+        outlook = self.system_inbox()
+        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
+        code, first = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn("Skipped (system or security email): Your verification code", first)
+        self.assertIn("System or security emails skipped: 1", first)
+        code, second = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertNotIn("Skipped (system or security email): Your verification code", second)
+        self.assertIn("System or security emails skipped: 1 (1 already reported earlier)", second)
+        self.assertEqual(outlook.categories("s1"), [])
+        self.assertEqual(outlook.where("s1"), "inbox")
+        self.assertNotIn("s1", self.state()["emails"])
+        self.assertIn("s1", self.state()["system_skipped"])
+
+    def test_case44_a_new_system_email_is_reported_when_it_arrives(self):
+        outlook = self.system_inbox()
+        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
+        self.live(outlook, gemini)
+        outlook.inbox["s2"] = msg("s2", "Your password was changed", received="2026-10-20T10:00:00Z")
+        code, output = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn("Skipped (system or security email): Your password was changed", output)
+        self.assertNotIn("Your verification code", output)
+        self.assertIn("System or security emails skipped: 2 (1 already reported earlier)", output)
+
+    def test_case44_a_dry_run_hides_reported_emails_and_never_changes_the_state(self):
+        outlook = self.system_inbox()
+        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
+        self.live(outlook, gemini)
+        before = self.state_path.read_bytes()
+        outlook.inbox["s2"] = msg("s2", "Your password was changed", received="2026-10-20T10:00:00Z")
+        code, output = self.run_main(outlook, gemini, [])
+        self.assertEqual(code, 0)
+        self.assertIn("Skipped (system or security email): Your password was changed", output)
+        self.assertNotIn("Your verification code", output)
+        self.assertEqual(self.state_path.read_bytes(), before)
+
+    def test_case44_a_dry_run_on_a_fresh_state_reports_but_creates_no_file(self):
+        outlook = self.system_inbox()
+        code, output = self.run_main(outlook, PretendGemini(), [])
+        self.assertEqual(code, 0)
+        self.assertIn("Skipped (system or security email): Your verification code", output)
+        self.assertFalse(self.state_path.exists())
+
+    def test_case45_old_memories_are_forgotten_and_recent_ones_kept(self):
+        self.state_path.write_text(json.dumps({
+            "version": 1, "emails": {},
+            "system_skipped": {"ancient": "2026-01-01", "recent": "2026-10-20"},
+        }), encoding="utf-8")
+        outlook = self.system_inbox()
+        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
+        code, _ = self.live(outlook, gemini)
+        self.assertEqual(code, 0)
+        remembered = self.state()["system_skipped"]
+        self.assertNotIn("ancient", remembered)
+        self.assertIn("recent", remembered)
+        self.assertIn("s1", remembered)
+
+    def test_case45_forgetting_old_memories_is_saved_even_when_nothing_else_happens(self):
+        self.state_path.write_text(json.dumps({
+            "version": 1, "emails": {}, "system_skipped": {"ancient": "2026-01-01"},
+        }), encoding="utf-8")
+        code, _ = self.live(PretendOutlook([]), PretendGemini())
+        self.assertEqual(code, 0)
+        self.assertEqual(self.state()["system_skipped"], {})
+
+    def test_case45_a_state_file_without_the_list_gets_one_when_needed(self):
+        self.state_path.write_text(json.dumps({"version": 1, "emails": {}}), encoding="utf-8")
+        outlook = self.system_inbox()
+        code, _ = self.live(outlook, PretendGemini({"Weekly newsletter": NOT_LEAD}))
+        self.assertEqual(code, 0)
+        self.assertIn("s1", self.state()["system_skipped"])
 
     def test_prompt_v2_and_the_config_model_are_used(self):
         outlook = PretendOutlook([msg("m1", "Demo please")])
