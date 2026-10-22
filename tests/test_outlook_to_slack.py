@@ -154,6 +154,12 @@ class OutlookToSlackTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        # These tests may themselves run on GitHub Actions; start from "not on Actions".
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("GITHUB_ACTIONS", None)
+
         # Block the real internet completely.
         import socket
 
@@ -404,6 +410,73 @@ class OutlookToSlackTests(unittest.TestCase):
             outlook_to_slack.save_refreshed_cache(self.make_cache({"k": "v"}))
         self.assertIn("no .env file", buffer.getvalue())
         self.assertFalse(self.env_path.exists())
+
+    # ---- Running on GitHub Actions ----------------------------------------
+
+    def save_on_actions(self, cache, value="true"):
+        buffer = io.StringIO()
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": value}), mock.patch.object(sys, "stdout", buffer):
+            outlook_to_slack.save_refreshed_cache(cache)
+        return buffer.getvalue()
+
+    def test_on_actions_the_refreshed_sign_in_is_not_written(self):
+        original = "A=1\nMS_TOKEN_CACHE=old\n"
+        self.env_path.write_text(original, encoding="utf-8")
+        cache = self.make_cache({"k": "new-secret"})
+        output = self.save_on_actions(cache)
+        self.assertEqual(self.env_path.read_text(encoding="utf-8"), original)
+        self.assertFalse(self.env_path.with_name(".env.tmp").exists())
+        cache.serialize.assert_not_called()
+        self.assertIn("GitHub Actions", output)
+        self.assertNotIn("new-secret", output)
+
+    def test_on_actions_with_no_env_file_nothing_is_created_and_nothing_crashes(self):
+        self.env_path.unlink()
+        self.save_on_actions(self.make_cache({"k": "v"}))
+        self.assertFalse(self.env_path.exists())
+
+    def test_an_empty_github_actions_variable_does_not_count_as_set(self):
+        self.env_path.write_text("MS_TOKEN_CACHE=old\n", encoding="utf-8")
+        self.save_on_actions(self.make_cache({"k": "v"}), value="")
+        self.assertNotIn("old", self.env_path.read_text(encoding="utf-8"))
+
+    def test_a_write_that_fails_does_not_crash_and_leaves_env_alone(self):
+        original = "A=1\nMS_TOKEN_CACHE=old\n"
+        self.env_path.write_text(original, encoding="utf-8")
+        buffer = io.StringIO()
+        with mock.patch.object(os, "replace", side_effect=PermissionError("read-only")), \
+                mock.patch.object(sys, "stdout", buffer):
+            outlook_to_slack.save_refreshed_cache(self.make_cache({"k": "new-secret"}))
+        self.assertIn("couldn't save the refreshed sign-in", buffer.getvalue())
+        self.assertNotIn("new-secret", buffer.getvalue())
+        self.assertEqual(self.env_path.read_text(encoding="utf-8"), original)
+        self.assertFalse(self.env_path.with_name(".env.tmp").exists())
+
+    def test_a_folder_that_cannot_be_checked_does_not_crash(self):
+        buffer = io.StringIO()
+        broken = mock.Mock()
+        broken.exists.side_effect = PermissionError("no access")
+        with mock.patch.object(outlook_to_slack, "ENV_PATH", broken), mock.patch.object(sys, "stdout", buffer):
+            outlook_to_slack.save_refreshed_cache(self.make_cache({"k": "v"}))
+        self.assertIn("couldn't save the refreshed sign-in", buffer.getvalue())
+
+    def test_getting_a_token_still_works_on_actions_when_the_cache_changed(self):
+        # The whole sign-in step must succeed even though the refreshed sign-in is not kept.
+        self.env_path.write_text("MS_CLIENT_ID=abc\nMS_TOKEN_CACHE=old\n", encoding="utf-8")
+        original = self.env_path.read_text(encoding="utf-8")
+        cache = self.make_cache({"k": "new-secret"})
+        cache.has_state_changed = True
+        app = mock.Mock()
+        app.get_accounts.return_value = [{"home_account_id": "x"}]
+        app.acquire_token_silent.return_value = {"access_token": FAKE_TOKEN}
+        fake_msal = mock.Mock(PublicClientApplication=mock.Mock(return_value=app))
+        with mock.patch.dict(sys.modules, {"msal": fake_msal}), \
+                mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), \
+                mock.patch.object(outlook_to_slack, "load_cache", return_value=cache), \
+                mock.patch.object(sys, "stdout", io.StringIO()):
+            token = outlook_to_slack.get_access_token(original, "abc")
+        self.assertEqual(token, FAKE_TOKEN)
+        self.assertEqual(self.env_path.read_text(encoding="utf-8"), original)
 
 
 if __name__ == "__main__":

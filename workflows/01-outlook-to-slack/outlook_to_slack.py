@@ -88,11 +88,18 @@ def load_cache(env_text):
 
 
 def save_refreshed_cache(cache):
-    """Save a refreshed token to .env, changing only the MS_TOKEN_CACHE line."""
-    if not ENV_PATH.exists():
-        print("Note: your sign-in was refreshed, but there is no .env file to save it in.")
+    """Save a refreshed token to .env, changing only the MS_TOKEN_CACHE line.
+
+    On GitHub Actions nothing is saved: the runner is thrown away after each run, and the
+    sign-in lives in the MS_TOKEN_CACHE secret, which a run can't change.
+    """
+    if os.environ.get("GITHUB_ACTIONS"):
+        print("Note: running on GitHub Actions, so the refreshed sign-in was not saved.")
         return
     try:
+        if not ENV_PATH.exists():
+            print("Note: your sign-in was refreshed, but there is no .env file to save it in.")
+            return
         # Read .env again right now so nothing added meanwhile is lost.
         env_text, has_bom = read_env_text()
         compact = json.dumps(json.loads(cache.serialize()), separators=(",", ":"))
