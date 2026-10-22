@@ -43,7 +43,13 @@ FAKE_TOKEN = "FAKE-ACCESS-TOKEN-SECRET"
 FAKE_CACHE = "FAKE-TOKEN-CACHE-SECRET"
 FAKE_KEY = "FAKE-GEMINI-KEY-SECRET"
 FAKE_ENV = {"MS_CLIENT_ID": "fake-client-id", "MS_TOKEN_CACHE": FAKE_CACHE, "GEMINI_API_KEY": FAKE_KEY}
-SECRETS = (FAKE_TOKEN, FAKE_CACHE, FAKE_KEY)
+LIVE_SLACK_SECRET = "FAKE-LIVE-WEBHOOK-SECRET"
+TEST_SLACK_SECRET = "FAKE-TEST-WEBHOOK-SECRET"
+LIVE_SLACK_URL = f"https://hooks.slack.com/services/T0LIVE/B0LIVE/{LIVE_SLACK_SECRET}"
+TEST_SLACK_URL = f"https://hooks.slack.com/services/T0TEST/B0TEST/{TEST_SLACK_SECRET}"
+SLACK_ENV = {"SLACK_WEBHOOK_URL": LIVE_SLACK_URL, "SLACK_TEST_WEBHOOK_URL": TEST_SLACK_URL}
+SECRETS = (FAKE_TOKEN, FAKE_CACHE, FAKE_KEY, LIVE_SLACK_SECRET, TEST_SLACK_SECRET)
+SLACK_MARKER = "com.novawellness.slackposted"
 BODY_MARKER = "PRIVATE-EMAIL-BODY-MARKER"
 
 NOW = datetime.datetime(2026, 10, 21, 12, 0, tzinfo=datetime.timezone.utc)
@@ -132,6 +138,9 @@ class PretendOutlook:
         self.extension_errors = extension_errors or {}   # {n: error} for the n-th save of an answer
         self.extensions = {}          # message id -> the saved extension (ours)
         self.extension_posts = []     # (message id, body) of every save
+        self.markers = {}             # (message id, extension name) -> a marker such as the Slack one
+        self.marker_posts = []        # (message id, body) of every marker saved
+        self.marker_errors = {}       # {n: error} for the n-th marker save
         self.requests = []
         self.patches = []
         self.moves = []
@@ -187,12 +196,29 @@ class PretendOutlook:
             saved = self.extensions.get(urllib.parse.unquote(found.group(1)))
             if saved is not None and saved["extensionName"] == urllib.parse.unquote(found.group(2)):
                 return FakeResponse(json.dumps(saved).encode())
+            marker = self.markers.get((urllib.parse.unquote(found.group(1)), urllib.parse.unquote(found.group(2))))
+            if marker is not None:
+                return FakeResponse(json.dumps(marker).encode())
             raise http_error(404)
 
         found = re.fullmatch(r"/me/messages/([^/]+)/extensions", path)
         if method == "POST" and found:
             message_id = urllib.parse.unquote(found.group(1))
             body = json.loads(request.data.decode())
+            if body.get("extensionName") != EXTENSION_NAME:
+                # a marker (for example the Slack one): kept apart from the saved answers
+                self.marker_posts.append((message_id, body))
+                error = self.marker_errors.get(len(self.marker_posts))
+                if error is not None:
+                    raise error
+                if message_id in self.inbox or message_id in self.leads:
+                    stored = {"@odata.type": "#microsoft.graph.openTypeExtension",
+                              "id": "Microsoft.OutlookServices.OpenTypeExtension." + body["extensionName"],
+                              **{k: v for k, v in body.items() if k != "@odata.type"}}
+                    self.markers[(message_id, body["extensionName"])] = stored
+                    return FakeResponse(json.dumps(stored).encode())
+                self.unexpected.append(f"{method} {request.full_url}")
+                raise urllib.error.URLError("pretend world: unknown email")
             self.extension_posts.append((message_id, body))
             error = self.extension_errors.get(len(self.extension_posts))
             if error is not None:
@@ -218,6 +244,8 @@ class PretendOutlook:
                 self.leads[moved["id"]] = moved
                 if message_id in self.extensions:        # saved data travels with the email
                     self.extensions[moved["id"]] = self.extensions.pop(message_id)
+                for key in [k for k in self.markers if k[0] == message_id]:
+                    self.markers[("moved-" + message_id, key[1])] = self.markers.pop(key)
                 return FakeResponse(json.dumps({"id": moved["id"]}).encode())
 
         self.unexpected.append(f"{method} {request.full_url}")
@@ -232,6 +260,10 @@ class PretendOutlook:
     def categories(self, message_id):
         return (self.inbox.get(message_id) or self.leads.get(message_id))["categories"]
 
+    def slack_marked(self, message_id):
+        """True if the email (by its Inbox id or its Leads id) carries the Slack marker."""
+        return ((message_id, SLACK_MARKER) in self.markers) or (("moved-" + message_id, SLACK_MARKER) in self.markers)
+
     def saved_answer(self, message_id):
         """The answer saved on an email (by its Inbox id or its Leads id), or None."""
         saved = self.extensions.get(message_id) or self.extensions.get("moved-" + message_id)
@@ -243,6 +275,29 @@ class PretendOutlook:
         if "moved-" + message_id in self.leads or message_id in self.leads:
             return "leads"
         return "gone"
+
+
+class PretendSlack:
+    """A pretend Slack webhook. Records every post (link used, text). errors: {n: error} for the n-th post."""
+
+    def __init__(self, errors=None):
+        self.errors = errors or {}
+        self.attempts = 0
+        self.posts = []          # (the link posted to, the text)
+
+    def urlopen(self, request, timeout=None):
+        self.attempts += 1
+        body = json.loads(request.data.decode())
+        if request.get_method() != "POST" or set(body) != {"text"} or not isinstance(body["text"], str):
+            raise http_error(400)
+        error = self.errors.get(self.attempts)
+        if error is not None:
+            raise error
+        self.posts.append((request.full_url, body["text"]))
+        return FakeResponse(b"ok")
+
+    def texts(self):
+        return [text for _, text in self.posts]
 
 
 class Raise:
@@ -374,8 +429,31 @@ class TriageTests(unittest.TestCase):
 
     # ---- helpers ---------------------------------------------------------
 
-    def run_main(self, outlook, gemini, argv=(), remove=(), token_error=None):
-        """Run main() against the pretend Outlook and Gemini. Returns (code, output)."""
+    def run_main(self, outlook, gemini, argv=(), remove=(), token_error=None, slack=None, env_changes=None):
+        """Run main() against the pretend Outlook, Gemini and Slack. Returns (code, output).
+
+        self.events lists, in order, every change the run made: save, slack:<which link>, slack_marker,
+        patch, move. A pretend Slack that nobody asked for fails the test if it is posted to."""
+        slack = slack if slack is not None else PretendSlack()
+        self.slack = slack
+        self.events = []
+
+        def dispatch(request, timeout=None):
+            if request.full_url.startswith("https://hooks.slack.com/"):
+                which = "test" if TEST_SLACK_SECRET in request.full_url else "live"
+                self.events.append(f"slack:{which}")
+                return slack.urlopen(request, timeout)
+            if request.get_method() != "GET":
+                path = urllib.parse.urlparse(request.full_url).path
+                if path.endswith("/extensions"):
+                    named = json.loads(request.data.decode()).get("extensionName") if request.data else None
+                    self.events.append("save" if named == EXTENSION_NAME else "slack_marker")
+                elif path.endswith("/move"):
+                    self.events.append("move")
+                else:
+                    self.events.append(request.get_method().lower())
+            return outlook.urlopen(request, timeout)
+
         buffer = io.BytesIO()
         out = io.TextIOWrapper(buffer, encoding="utf-8", write_through=True)
         if token_error is not None:
@@ -383,10 +461,11 @@ class TriageTests(unittest.TestCase):
         else:
             token_patch = mock.patch.object(outlook_triage, "get_access_token", return_value=FAKE_TOKEN)
         env_before = self.env_path.read_bytes()
-        with mock.patch.dict(os.environ, FAKE_ENV), \
+        env = {**FAKE_ENV, **SLACK_ENV, **(env_changes or {})}
+        with mock.patch.dict(os.environ, env), \
                 mock.patch.object(sys, "argv", ["outlook_triage.py", *argv]), \
                 mock.patch.object(sys, "stdout", out), \
-                mock.patch("urllib.request.urlopen", outlook.urlopen), \
+                mock.patch("urllib.request.urlopen", dispatch), \
                 mock.patch("requests.post", gemini.post), \
                 token_patch:
             for name in remove:
@@ -1574,6 +1653,256 @@ class TriageTests(unittest.TestCase):
                 self.assertEqual(body["extensionName"], EXTENSION_NAME)
 
     def test_t9_the_permission_is_still_exactly_mail_readwrite(self):
+        self.assertEqual(outlook_signin.SCOPES, ["Mail.ReadWrite"])
+
+
+    # ==== The Slack step (tests/cases/13-slack-step.md, Part B) ===========================
+
+    def two_leads(self):
+        outlook = PretendOutlook([
+            msg("m1", "Demo please", received="2026-10-20T08:00:00Z", sender="one@example.com"),
+            msg("m2", "Prices please", received="2026-10-20T09:00:00Z", sender="two@example.com"),
+        ])
+        gemini = PretendGemini({"Demo please": lead_reply("demo"), "Prices please": lead_reply("pricing")})
+        return outlook, gemini
+
+    def test_s7_slack_is_off_by_default_and_with_off(self):
+        for extra in ((), ("--slack", "off")):
+            with self.subTest(extra=extra):
+                self.state_path.unlink(missing_ok=True)
+                outlook = PretendOutlook([msg("m1", "Demo please")])
+                gemini = PretendGemini({"Demo please": lead_reply("demo")})
+                code, output = self.live(outlook, gemini, *extra)
+                self.assertEqual(code, 0)
+                self.assertEqual(self.slack.attempts, 0)
+                self.assertEqual(outlook.marker_posts, [])
+                self.assertNotIn("Slack", output)
+                self.assertEqual(self.events, ["save", "patch", "move"])
+
+    def test_s8_test_posts_only_to_the_test_link_and_live_only_to_the_live_link(self):
+        for mode, link in (("test", TEST_SLACK_URL), ("live", LIVE_SLACK_URL)):
+            with self.subTest(mode=mode):
+                self.state_path.unlink(missing_ok=True)
+                outlook = PretendOutlook([msg("m1", "Demo please")])
+                gemini = PretendGemini({"Demo please": lead_reply("demo")})
+                code, _ = self.live(outlook, gemini, "--slack", mode)
+                self.assertEqual(code, 0)
+                self.assertEqual([url for url, _ in self.slack.posts], [link])
+
+    def test_s8_a_missing_setting_stops_before_anything_is_read_or_changed(self):
+        for mode, name in (("test", "SLACK_TEST_WEBHOOK_URL"), ("live", "SLACK_WEBHOOK_URL")):
+            for argv in (["--live", "--slack", mode], ["--slack", mode]):
+                with self.subTest(mode=mode, live="--live" in argv):
+                    outlook = PretendOutlook([msg("m1", "Demo please")])
+                    gemini = PretendGemini({"Demo please": lead_reply("demo")})
+                    code, output = self.run_main(outlook, gemini, argv, remove=[name])
+                    self.assertEqual(code, 1)
+                    self.assertIn(name, output)
+                    self.assertIn("Nothing was changed", output)
+                    self.assertEqual(outlook.requests, [])
+                    self.assertEqual(gemini.calls, [])
+                    self.assertEqual(self.slack.attempts, 0)
+
+    def test_s8_the_other_mode_setting_is_not_needed(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, _ = self.live(outlook, gemini, "--slack", "test", remove=["SLACK_WEBHOOK_URL"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.slack.posts), 1)
+
+    def test_s8_a_value_other_than_off_test_or_live_is_refused(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        errors = io.StringIO()
+        with mock.patch.object(sys, "stderr", errors):
+            with self.assertRaises(SystemExit):
+                self.live(outlook, gemini, "--slack", "banana")
+        self.assertIn("invalid choice", errors.getvalue())
+        self.assertIn("off", errors.getvalue())
+        self.assertEqual(outlook.requests, [])
+
+    def test_s9_only_leads_are_posted_each_exactly_once(self):
+        outlook = PretendOutlook([
+            msg("m1", "Demo please", received="2026-10-20T07:00:00Z"),
+            msg("m2", "Weekly newsletter", received="2026-10-20T08:00:00Z"),
+            msg("m3", "Odd one", received="2026-10-20T09:00:00Z"),
+            msg("m4", "Mismatch", received="2026-10-20T10:00:00Z"),
+            msg("m5", "Prices please", received="2026-10-20T11:00:00Z"),
+        ])
+        gemini = PretendGemini({
+            "Demo please": lead_reply("demo"),
+            "Weekly newsletter": NOT_LEAD,
+            "Odd one": json.dumps({"is_lead": False, "category": "Needs review"}),
+            "Mismatch": json.dumps(lead_answer("pricing", category="Lead - Demo")),
+            "Prices please": lead_reply("pricing"),
+        })
+        code, _ = self.live(outlook, gemini, "--slack", "test")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.slack.texts(), ["Lead - Demo: sam@example.com, Demo please",
+                                              "Lead - Pricing: sam@example.com, Prices please"])
+        self.assertEqual(len(outlook.marker_posts), 2)
+        for message_id in ("m2", "m3", "m4"):
+            self.assertFalse(outlook.slack_marked(message_id))
+
+    def test_s9_a_second_run_posts_nothing_more(self):
+        outlook, gemini = self.two_leads()
+        self.live(outlook, gemini, "--slack", "test")
+        self.assertEqual(len(self.slack.posts), 2)
+        self.live(outlook, gemini, "--slack", "test", slack=self.slack)
+        self.assertEqual(len(self.slack.posts), 2)
+
+    def test_s9_a_move_retry_does_not_post_again(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")], move_errors={1: http_error(500)})
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, _ = self.live(outlook, gemini, "--slack", "test")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.slack.posts), 1)
+        code, _ = self.live(outlook, gemini, "--slack", "test", slack=self.slack)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.slack.posts), 1)
+        self.assertEqual(outlook.where("m1"), "leads")
+
+    def test_s9_a_retry_after_a_failed_category_change_does_not_post_again(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")], patch_errors={1: http_error(403)})
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, _ = self.live(outlook, gemini, "--slack", "test")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.slack.posts), 1)
+        code, output = self.live(outlook, gemini, "--slack", "test", slack=self.slack)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(gemini.calls), 2, "it asks again, as before")
+        self.assertEqual(len(self.slack.posts), 1, "but the marker stops a second post")
+        self.assertIn("already posted to Slack earlier", output)
+
+    def test_s10_the_order_is_save_then_slack_then_category_then_move(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        self.live(outlook, gemini, "--slack", "test")
+        self.assertEqual(self.events, ["save", "slack:test", "slack_marker", "patch", "move"])
+        self.assertTrue(outlook.slack_marked("m1"))
+        self.assertIn(("moved-m1", SLACK_MARKER), outlook.markers, "the marker travels with the email")
+
+    def test_s10_a_non_lead_has_no_slack_in_its_changes(self):
+        outlook = PretendOutlook([msg("m1", "Weekly newsletter")])
+        gemini = PretendGemini({"Weekly newsletter": NOT_LEAD})
+        self.live(outlook, gemini, "--slack", "test")
+        self.assertEqual(self.events, ["patch"])
+
+    def test_s11_if_slack_is_down_the_run_stops_and_the_email_is_left_untouched(self):
+        outlook, gemini = self.two_leads()
+        slack = PretendSlack(errors={1: http_error(500)})
+        code, output = self.live(outlook, gemini, "--slack", "test", slack=slack)
+        self.assertEqual(code, 1)
+        self.assertIn("Slack refused the message (code 500)", output)
+        self.assertEqual(outlook.patches, [])
+        self.assertEqual(outlook.moves, [])
+        self.assertEqual(outlook.where("m1"), "inbox")
+        self.assertEqual(outlook.categories("m1"), [])
+        self.assertFalse(self.state_path.exists() and "m1" in self.state()["emails"])
+        self.assertIsNotNone(outlook.saved_answer("m1"), "the saved answer stays")
+        self.assertEqual(slack.attempts, 1, "nothing is posted for the later email")
+        self.assertEqual(outlook.where("m2"), "inbox")
+        self.assertFalse(outlook.slack_marked("m1"))
+        for secret in (TEST_SLACK_SECRET, "hooks.slack.com"):
+            self.assertNotIn(secret, output)
+
+    def test_s11_the_next_run_with_slack_working_finishes_the_lead_with_one_post(self):
+        outlook, gemini = self.two_leads()
+        self.live(outlook, gemini, "--slack", "test", slack=PretendSlack(errors={1: http_error(500)}))
+        code, _ = self.live(outlook, gemini, "--slack", "test")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.slack.texts(), ["Lead - Demo: one@example.com, Demo please",
+                                              "Lead - Pricing: two@example.com, Prices please"])
+        self.assertEqual(len(outlook.extension_posts), 2, "no second saved answer for the first lead")
+        self.assertEqual((outlook.where("m1"), outlook.where("m2")), ("leads", "leads"))
+
+    def test_s11_slack_unreachable_is_explained_and_stops_the_run(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        slack = PretendSlack(errors={1: urllib.error.URLError("pretend: down")})
+        code, output = self.live(outlook, gemini, "--slack", "test", slack=slack)
+        self.assertEqual(code, 1)
+        self.assertIn("couldn't reach Slack", output)
+        self.assertNotIn("URLError", output)
+        self.assertEqual((outlook.patches, outlook.moves), ([], []))
+
+    def test_s11_a_marker_that_could_not_be_saved_stops_with_the_plain_warning(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        outlook.marker_errors = {1: http_error(500)}
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, output = self.live(outlook, gemini, "--slack", "test")
+        self.assertEqual(code, 1)
+        self.assertIn("posted to Slack", output)
+        self.assertIn("twice", output)
+        self.assertEqual((outlook.patches, outlook.moves), ([], []))
+
+    def test_s12_the_output_says_what_happened_without_the_link_or_the_text(self):
+        outlook, gemini = self.two_leads()
+        code, output = self.live(outlook, gemini, "--slack", "test")
+        self.assertEqual(code, 0)
+        self.assertEqual(output.count("posted to Slack (test)"), 2)
+        self.assertIn("Posted to Slack (test): 2", output)
+        for text in self.slack.texts():
+            self.assertNotIn(text, output)
+        for secret in (TEST_SLACK_SECRET, LIVE_SLACK_SECRET, "hooks.slack.com"):
+            self.assertNotIn(secret, output)
+            self.assertNotIn(secret, self.saved_text())
+        self.assertNotIn("Slack", self.saved_text())
+
+    def test_s12_the_live_mode_is_named_in_the_output(self):
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, output = self.live(outlook, gemini, "--slack", "live")
+        self.assertEqual(code, 0)
+        self.assertIn("posted to Slack (live)", output)
+        self.assertIn("Posted to Slack (live): 1", output)
+
+    def test_s12_only_the_category_sender_and_subject_are_in_the_post(self):
+        outlook = PretendOutlook([msg("m1", "Demo please", body="PRIVATE-BODY-WORDS", name="Display Name Marker")])
+        answer = lead_answer("demo", name="NAME-MARKER-PERSON", company="COMPANY-MARKER-CO", role="ROLE-MARKER-JOB",
+                             summary="SUMMARY-MARKER-TEXT")
+        gemini = PretendGemini({"Demo please": json.dumps(answer)})
+        self.live(outlook, gemini, "--slack", "test")
+        (text,) = self.slack.texts()
+        self.assertEqual(text, "Lead - Demo: sam@example.com, Demo please")
+        for marker in ("NAME-MARKER", "COMPANY-MARKER", "ROLE-MARKER", "SUMMARY-MARKER", "DRAFT", "PRIVATE-BODY",
+                       BODY_MARKER, "Display Name Marker", "A member of our team"):
+            self.assertNotIn(marker, text)
+
+    def test_s13_a_dry_run_posts_nothing_marks_nothing_and_changes_nothing(self):
+        for mode in ("test", "live"):
+            with self.subTest(mode=mode):
+                outlook, gemini = self.two_leads()
+                code, output = self.run_main(outlook, gemini, ["--slack", mode])
+                self.assertEqual(code, 0)
+                self.assertEqual(self.slack.attempts, 0)
+                self.assertEqual(outlook.changes(), [])
+                self.assertEqual(gemini.calls, [])
+                self.assertIn(f"Slack posting: {mode}", output)
+                self.assertIn("dry run", output.lower())
+                self.assertNotIn(TEST_SLACK_SECRET, output)
+                self.assertNotIn(LIVE_SLACK_SECRET, output)
+
+    def test_s14_it_waits_between_two_posts_but_not_before_the_first(self):
+        outlook, gemini = self.two_leads()
+        self.live(outlook, gemini, "--slack", "test")
+        pause = outlook_triage.lead_slack.PAUSE_SECONDS
+        self.assertEqual(self.sleeps.count(pause), 1)
+        self.sleeps.clear()
+        outlook = PretendOutlook([msg("m1", "Demo please")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        self.state_path.unlink(missing_ok=True)
+        self.live(outlook, gemini, "--slack", "test")
+        self.assertEqual(self.sleeps.count(pause), 0)
+
+    def test_the_slack_step_keeps_the_triage_send_proof(self):
+        outlook, gemini = self.two_leads()
+        self.live(outlook, gemini, "--slack", "test")
+        for request in outlook.requests:
+            path = urllib.parse.urlparse(request.full_url).path.lower()
+            for word in ("/send", "/reply", "/forward", "/copy", "/createreply", "/permanentdelete"):
+                self.assertNotIn(word, path)
+            self.assertNotIn(request.get_method(), ("DELETE", "PUT"))
         self.assertEqual(outlook_signin.SCOPES, ["Mail.ReadWrite"])
 
 

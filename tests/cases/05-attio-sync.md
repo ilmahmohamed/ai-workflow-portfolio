@@ -10,6 +10,8 @@ What the script does: it reads the emails in the Outlook Leads folder. For each 
 3. creates a deal named "<company or person name>: <request type>" at stage New with an owner, linked to the person and company, and adds a note. If the same person already has a deal at stage New, it adds a note to that deal instead.
 After everything worked, it moves the email from Leads to Leads/Processed. If anything fails, the email stays in Leads and the next run tries again, without duplicates.
 
+> **Update (Day 8).** The Attio step no longer asks Gemini. The triage asks Gemini once (prompt v3) and saves the answer on the email; this step reads that saved answer, and an email with no usable saved answer is marked "needs a person". So the cases about Gemini in this file (34, 35 and 57 to 62) describe the old behaviour and are kept only for history. They are replaced by Part B of 11-single-call-pipeline.md, and their tests were rewritten. Case 63 was added after the Day 8 run. The live results and one known Attio side effect are at the end of this file.
+
 Some expected results depend on the "Assumptions for Ilmah" at the end of this file. Where they do, the case says which assumption.
 
 ## Case 1: a new person at a new company
@@ -460,3 +462,42 @@ I made these to be able to write the cases. Please approve or change each one.
 15. **Attio objects.** Only the standard People, Companies and Deals objects and notes are used, with no custom fields (for example no field for the Outlook email ID). That is why the state file and the note reference are the guard against duplicates.
 16. **Categories.** Moving an email to Processed does not change its Outlook categories (Lead - Demo and so on).
 17. **--only-subject.** I added it (Case 40) so the first live test can be limited to one test email, the same way the triage was tested. Delete it if you don't want it.
+
+## Case 63: a company lookup prefers the exact root domain (added after the Day 8 run)
+
+- Why: in the Day 8 run, adding a person whose address was at freemail.example.com made Attio create a second company on its own, "Example Domain" at that subdomain. The lookup matches by root domain, so it found both companies, took the first, and split the leads across the two.
+- Input: Attio holds a company at a subdomain (for example freemail.brightwell.example) and one at the exact root domain (brightwell.example), in either order, and a lead arrives from the root domain or from the subdomain.
+- Expected: the company whose domain is exactly the root domain is used, whichever comes first. The person is linked to it, the deal is named after it and linked to it, and no company is created. The same holds for every lead in a run and in a dry run, and for two-part endings (mail.acme.co.uk uses acme.co.uk).
+- Input: only a company at a subdomain exists.
+- Expected: it is used as the fallback, and no company is created.
+- Input: no company exists for the root domain at all.
+- Expected: one is still created for the root domain, as before.
+- Not covered by this fix: Attio may still create its own empty company at the subdomain (see "Known Attio side effect" below).
+
+## Known Attio side effect (accepted, not fixed)
+
+- What: when a person is created with an email address at a domain that has no company of its own (for example a lead who writes from freemail.brightwell.example when only brightwell.example has a company), Attio itself creates a company for that exact domain. It is shown as created by "system", it is empty (no people and no deals), and it is not made by this script, so the report still says "Companies created: 0".
+- Seen: twice with the 30 test emails, both times with the two senders at freemail.example.com: in the full run, and again in the re-test after the Case 63 fix. Each time one extra empty company called "Example Domain" appeared.
+- Effect: none on the records this script makes. After the Case 63 fix every person and every deal is linked to the company with the exact root domain, and the extra company stays empty. It is only a stray record.
+- Decision (Day 8): accepted as a known Attio side effect for senders on a subdomain. The empty company is deleted by hand.
+- A possible later fix, not tried: create the person already linked to the company in one request, to see whether Attio then skips its own company. That is only a guess about how Attio behaves, and it would need a live re-test.
+- What to do after real subdomain senders: look for an empty company with the same name as an existing one, and delete it by hand.
+
+## Day 8 live result: the 30 test emails through the whole pipeline (22 Oct)
+
+How it was run: a one-off loader (day8_loader.py, cases in 14-day8-loader.md) created the 30 test emails in the Inbox with the subject tag "[DAY8]". Every step used --only-subject "[DAY8]", Slack posted to a test channel only, and both scheduled tasks stayed disabled. Order: a pilot with 2 emails, then the other 28, each step as a dry run first and then live.
+
+| Part | Result |
+|---|---|
+| Triage | 29 of the 30 were handled. The 30th (a no-reply sender) was skipped and left untouched by the system-email rule, by design. |
+| Categories | 23 leads (9 Demo, 8 Pricing, 6 Other) and 6 Not a lead. 28 of the 29 match the answer key. The one difference is the email "Still waiting for the quote": the triage called it Not a lead and the key says Lead - Pricing. Gemini missed it in the accuracy runs too. |
+| Slack (test channel) | 23 posts, one per lead and none for non-leads. A second triage run posted nothing. Each lead email carries exactly one "posted" marker. |
+| Attio people | 22 different senders: 20 new people, and 2 already existed. No duplicate person. |
+| Attio companies | None created by this script. The leads were first split between two companies (found by this run, fixed by Case 63); the re-test below shows they now link to one. |
+| Attio deals | 22 deals, exactly one New deal per person, all with the owner set. A sender's second email added a note to their existing deal instead of making a second one. |
+| Attio notes | 23, one per lead email, each with its own reference code. |
+| Outlook | All 23 handled lead emails are in Leads/Processed. The other 7 are in the Inbox (6 categorised, 1 untouched). |
+| Re-test after the fix | Four emails (including both senders at freemail.example.com) were reloaded after a cleanup. Result: 4 leads, 4 Slack posts, 4 new people, 4 New deals and 4 notes, all linked to the original company at example.com, with no duplicate person, deal or note. Attio again created an empty extra company (see the known side effect above). |
+
+What was and was not checked by hand: the Slack channel itself was checked by hand for the pilot (exactly one message). For the full run and the re-test, the posts were counted by the triage's own report and by the markers on the emails.
+

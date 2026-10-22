@@ -7,7 +7,9 @@ and a short draft reply. Then, in Outlook, it adds one category:
 The category is checked against the request type, never just trusted (see v3_reply.py).
 For a real lead it also saves the answer on the email itself (a small hidden extension, see
 saved_results.py) before moving the email into the Leads folder, so the Attio step can read it there
-and never needs to ask Gemini again. Not a lead and Needs review emails stay in the Inbox and get
+and never needs to ask Gemini again. With --slack test or --slack live it also posts one short message
+to Slack for the lead (see lead_slack.py), once, before the category is added and the email is moved.
+Slack is off by default. Not a lead and Needs review emails stay in the Inbox and get
 nothing saved. Handled emails are remembered in a small state file (triage-state.json, next to this
 script, git-ignored) so nothing is handled twice. The state file holds no lead details.
 
@@ -20,8 +22,10 @@ No token or key is ever printed, and no lead detail or draft text is printed or 
 Run:  python workflows\\02-email-to-attio\\outlook_triage.py
       python workflows\\02-email-to-attio\\outlook_triage.py --only-subject "TRIAGE-TEST"
       python workflows\\02-email-to-attio\\outlook_triage.py --live --only-subject "TRIAGE-TEST"
+      python workflows\\02-email-to-attio\\outlook_triage.py --live --slack test
 Needs: MS_CLIENT_ID and MS_TOKEN_CACHE (run outlook_signin.py once first), the msal
-       library, and for --live also GEMINI_API_KEY.
+       library, and for --live also GEMINI_API_KEY. --slack test needs SLACK_TEST_WEBHOOK_URL and
+       --slack live needs SLACK_WEBHOOK_URL (both in .env, never printed).
 """
 
 import argparse
@@ -41,6 +45,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "01-outlook-to-slack"))
 
 import extract_leads  # noqa: E402
+import lead_slack  # noqa: E402
 import saved_results  # noqa: E402
 import v3_reply  # noqa: E402
 from extract_leads import ask_gemini, build_message, get_api_key, load_model, load_prompt, parse_reply  # noqa: E402
@@ -75,7 +80,12 @@ SYSTEM_SUBJECT_PATTERNS = tuple(
 )
 EXEMPT_SUBJECT = "triage-test"   # our own test emails are never treated as system emails
 
-PROBLEMS = (SignInProblem, extract_leads.SetupProblem, saved_results.SavedResultProblem)
+PROBLEMS = (SignInProblem, extract_leads.SetupProblem, saved_results.SavedResultProblem,
+            lead_slack.LeadSlackProblem)
+
+# --slack off|test|live: which Slack link (named in .env) is used. The links themselves are never printed.
+SLACK_MODES = ("off", "test", "live")
+SLACK_SETTINGS = {"test": "SLACK_TEST_WEBHOOK_URL", "live": "SLACK_WEBHOOK_URL"}
 
 
 class OutlookRefused(Exception):
@@ -88,6 +98,20 @@ class OutlookRefused(Exception):
 
 def now():
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def slack_link(mode):
+    """The Slack link for the chosen mode, or None when Slack is off. Stops, naming only the setting, if it is missing."""
+    if mode == "off":
+        return None
+    name = SLACK_SETTINGS[mode]
+    link = extract_leads.read_env_value(name)
+    if not link:
+        raise lead_slack.LeadSlackProblem(
+            f"I can't find {name}, which --slack {mode} needs. "
+            "Add it to your .env file, or run with --slack off. Nothing was changed."
+        )
+    return link
 
 
 # ---- Talking to Outlook -----------------------------------------------------
@@ -313,10 +337,12 @@ def choose_emails(messages, state, since, only_subject):
     return eligible, skipped, system
 
 
-def dry_run(model, prompt_version, eligible, skipped, waiting):
+def dry_run(model, prompt_version, eligible, skipped, waiting, slack_mode="off"):
     print("Dry run: nothing will be sent to Gemini and nothing will be changed in Outlook.")
     print(f"Prompt version: {prompt_version}")
     print(f"Model: {model}")
+    if slack_mode != "off":
+        print(f"Slack posting: {slack_mode} (nothing is posted in a dry run)")
     for message, kind in eligible:
         address, _ = sender_of(message)
         action = "would send to Gemini" if kind == "new" else "would retry moving to Leads"
@@ -355,12 +381,14 @@ def remember_system_emails(state, new_system):
         save_state(state)
 
 
-def live_run(token, key, model, prompt, state, eligible, skipped, waiting, system_count, system_already=0):
+def live_run(token, key, model, prompt, state, eligible, skipped, waiting, system_count, system_already=0,
+             slack_url=None, slack_mode="off"):
     leads_id = find_leads_folder(token)   # stops here, before any change, if there is no Leads folder
     counts = {}
     broken = 0
     handled = 0
     asked = 0
+    posted = 0
     try:
         for message, kind in eligible:
             address, _ = sender_of(message)
@@ -385,6 +413,16 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
                 if is_lead:
                     # Saved first, while the email's id is known: if this fails nothing else was changed.
                     saved_results.save_result(token, message["id"], result)
+                    if slack_url:
+                        # Then announced, once (a marker on the email stops a second post), before the email
+                        # is categorised or moved. If Slack is down the run stops and the email is left as it is.
+                        if posted:
+                            time.sleep(lead_slack.PAUSE_SECONDS)
+                        if lead_slack.announce_lead(token, message, category, slack_url) == "posted":
+                            posted += 1
+                            print(f"  posted to Slack ({slack_mode})")
+                        else:
+                            print("  already posted to Slack earlier")
                 add_category(token, message, category)
                 record(state, message["id"], category, "categorised" if is_lead else "done", urgency,
                        message.get("internetMessageId"))
@@ -410,16 +448,19 @@ def live_run(token, key, model, prompt, state, eligible, skipped, waiting, syste
     print(f"Skipped (already handled or already tagged): {skipped}")
     print_system_count(system_count, system_already)
     print(f"Broken replies: {broken}")
+    if slack_url:
+        print(f"Posted to Slack ({slack_mode}): {posted}")
     if waiting:
         print(f"{waiting} still waiting for the next run.")
     return 0
 
 
-def run(live, only_subject, prompt_version):
+def run(live, only_subject, prompt_version, slack_mode="off"):
     if only_subject is not None and not only_subject.strip():
         raise SignInProblem(
             "The --only-subject text must not be empty, because empty text would match every email."
         )
+    slack_url = slack_link(slack_mode)     # stops here, before anything is read or changed, if it is missing
     env_text, _ = read_env_text()
     client_id = get_client_id(env_text)
     model = load_model()
@@ -456,10 +497,11 @@ def run(live, only_subject, prompt_version):
         return 0
 
     if not live:
-        code = dry_run(model, prompt_version, eligible, skipped, waiting)
+        code = dry_run(model, prompt_version, eligible, skipped, waiting, slack_mode)
         print_system_count(len(system), system_already)
         return code
-    return live_run(token, key, model, prompt, state, eligible, skipped, waiting, len(system), system_already)
+    return live_run(token, key, model, prompt, state, eligible, skipped, waiting, len(system), system_already,
+                    slack_url, slack_mode)
 
 
 def main():
@@ -476,10 +518,16 @@ def main():
         metavar="TEXT",
         help="only handle emails whose subject contains TEXT (never widens the search)",
     )
+    parser.add_argument(
+        "--slack",
+        choices=SLACK_MODES,
+        default="off",
+        help="post each lead to Slack once: off (default), test (the test channel) or live (the real #leads channel)",
+    )
     args = parser.parse_args()
 
     try:
-        return run(args.live, args.only_subject, args.prompt)
+        return run(args.live, args.only_subject, args.prompt, args.slack)
     except PROBLEMS as problem:
         print(problem)
         return 1

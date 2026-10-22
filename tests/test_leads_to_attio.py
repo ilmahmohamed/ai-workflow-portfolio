@@ -354,6 +354,20 @@ class PretendAttio:
     def company_ids(self, domain):
         return [cid for cid, c in self.companies.items() if c["domain"] == domain.lower()]
 
+    TWO_PART_ENDINGS = {"co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au", "co.nz"}
+
+    @classmethod
+    def root_of(cls, domain):
+        """The root domain of a domain, the way Attio works it out (mail.acme.co.uk -> acme.co.uk)."""
+        labels = domain.lower().split(".")
+        if len(labels) >= 3 and ".".join(labels[-2:]) in cls.TWO_PART_ENDINGS:
+            return ".".join(labels[-3:])
+        return ".".join(labels[-2:]) if len(labels) >= 2 else domain.lower()
+
+    def companies_by_root(self, root):
+        """Every company whose domain has this root domain, the exact domain and subdomains alike (in the order added)."""
+        return [cid for cid, c in self.companies.items() if self.root_of(c["domain"]) == root.lower()]
+
     def deals_of(self, person_id):
         return [d for d in self.deals.values() if person_id in d["people"]]
 
@@ -407,7 +421,7 @@ class PretendAttio:
         c = self.companies[cid]
         return {"id": {"record_id": cid},
                 "values": {"name": [{"value": c["name"]}],
-                           "domains": [{"domain": c["domain"], "root_domain": c["domain"]}]}}
+                           "domains": [{"domain": c["domain"], "root_domain": self.root_of(c["domain"])}]}}
 
     def deal_record(self, did):
         d = self.deals[did]
@@ -455,7 +469,7 @@ class PretendAttio:
 
         if method == "POST" and path == "/v2/objects/companies/records/query":
             wanted = leaf(body.get("filter", {}).get("domains"))
-            return FakeHTTP(200, {"data": [self.company_record(cid) for cid in self.company_ids(wanted or "")]})
+            return FakeHTTP(200, {"data": [self.company_record(cid) for cid in self.companies_by_root(wanted or "")]})
         if method == "POST" and path == "/v2/objects/companies/records":
             values = body["data"]["values"]
             domain = text_of(values["domains"], "domain").lower()
@@ -944,6 +958,113 @@ class LeadsToAttioTests(unittest.TestCase):
             "Hello", info(name="Cai", email="cai@mail.acme.co.uk", company="Acme"))
         self.live(outlook, attio, gemini)
         self.assertEqual([c["domain"] for c in attio.companies.values()], ["acme.co.uk"])
+
+    # ---- Case 63: a company lookup prefers the record whose domain is exactly the root domain -------------------
+    # (found in the Day 8 run: Attio itself made a second company for freemail.example.com, and the lookup, which
+    #  matches subdomains too, then took the first match and split the leads across the two companies)
+
+    def two_companies(self, attio, subdomain_first):
+        """A company at a subdomain and one at the exact root domain, in the order asked for. Returns their ids."""
+        if subdomain_first:
+            sub = attio.add_company("Sub Brightwell", "freemail.brightwell.example")
+            exact = attio.add_company("Brightwell Gyms", "brightwell.example")
+        else:
+            exact = attio.add_company("Brightwell Gyms", "brightwell.example")
+            sub = attio.add_company("Sub Brightwell", "freemail.brightwell.example")
+        return sub, exact
+
+    def test_case63_the_exact_root_domain_company_wins_whichever_comes_first(self):
+        for subdomain_first in (True, False):
+            with self.subTest(subdomain_first=subdomain_first):
+                self.state_path.unlink(missing_ok=True)
+                outlook, attio, gemini = self.one_lead()
+                sub, exact = self.two_companies(attio, subdomain_first)
+                code, _ = self.live(outlook, attio, gemini)
+                self.assertEqual(code, 0)
+                self.assertEqual(len(attio.companies), 2, "no company may be created")
+                (pid,) = attio.person_ids("nora@brightwell.example")
+                (deal,) = attio.deals_of(pid)
+                self.assertEqual(deal["company"], exact)
+                self.assertEqual(deal["name"], "Brightwell Gyms: demo")
+                self.assertEqual(attio.people[pid]["company"], exact)
+
+    def test_case63_a_sender_on_a_subdomain_still_gets_the_exact_root_domain_company(self):
+        for subdomain_first in (True, False):
+            with self.subTest(subdomain_first=subdomain_first):
+                self.state_path.unlink(missing_ok=True)
+                outlook, attio, gemini = self.one_lead(
+                    "Demo please", info(name="Lena Fischer", email="lena@freemail.brightwell.example"),
+                    sender="lena@freemail.brightwell.example", name="Lena Fischer")
+                sub, exact = self.two_companies(attio, subdomain_first)
+                code, _ = self.live(outlook, attio, gemini)
+                self.assertEqual(code, 0)
+                self.assertEqual(len(attio.companies), 2)
+                (pid,) = attio.person_ids("lena@freemail.brightwell.example")
+                (deal,) = attio.deals_of(pid)
+                self.assertEqual(deal["company"], exact)
+                self.assertEqual(deal["name"], "Brightwell Gyms: demo")
+
+    def test_case63_every_lead_in_a_run_uses_the_same_exact_company(self):
+        outlook = PretendOutlook(leads=[
+            lead_msg("m1", "From Nora", received="2026-10-20T08:00:00Z"),
+            lead_msg("m2", "From Lena", sender="lena@freemail.brightwell.example", name="Lena Fischer",
+                     received="2026-10-20T09:00:00Z"),
+            lead_msg("m3", "From Omar", sender="omar@brightwell.example", name="Omar Haddad",
+                     received="2026-10-20T10:00:00Z"),
+        ])
+        gemini = PretendGemini({
+            "From Nora": info(),
+            "From Lena": info(name="Lena Fischer", email="lena@freemail.brightwell.example"),
+            "From Omar": info(name="Omar Haddad", email="omar@brightwell.example"),
+        })
+        attio = PretendAttio()
+        sub, exact = self.two_companies(attio, subdomain_first=True)
+        code, _ = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(attio.companies), 2)
+        self.assertEqual(sorted({d["company"] for d in attio.deals.values()}), [exact])
+        self.assertEqual(len(attio.deals), 3)
+
+    def test_case63_a_subdomain_company_is_only_the_fallback_when_there_is_no_exact_one(self):
+        outlook, attio, gemini = self.one_lead()
+        only = attio.add_company("Sub Brightwell", "mail.brightwell.example")
+        code, output = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(attio.companies), 1, "the subdomain company is used, and no company is created")
+        (pid,) = attio.person_ids("nora@brightwell.example")
+        (deal,) = attio.deals_of(pid)
+        self.assertEqual(deal["company"], only)
+        self.assertEqual(deal["name"], "Sub Brightwell: demo")
+
+    def test_case63_with_no_company_at_all_one_is_still_made_for_the_root_domain(self):
+        outlook, attio, gemini = self.one_lead(
+            "Demo please", info(name="Lena Fischer", email="lena@freemail.brightwell.example"),
+            sender="lena@freemail.brightwell.example", name="Lena Fischer")
+        code, _ = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        self.assertEqual([c["domain"] for c in attio.companies.values()], ["brightwell.example"])
+
+    def test_case63_a_dry_run_plans_the_exact_company_too(self):
+        outlook, attio, gemini = self.one_lead()
+        self.two_companies(attio, subdomain_first=True)
+        code, output = self.dry(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        self.assertIn("company already exists: brightwell.example", output)
+        self.assertIn("would create deal: Brightwell Gyms: demo", output)
+        self.assertEqual(attio.writes(), [])
+
+    def test_case63_two_part_endings_keep_both_parts_and_still_prefer_the_exact_domain(self):
+        outlook, attio, gemini = self.one_lead(
+            "Demo please", info(name="Nora Fischer", email="nora@mail.acme.co.uk"),
+            sender="nora@mail.acme.co.uk", name="Nora Fischer")
+        sub = attio.add_company("Mail Acme", "mail.acme.co.uk")
+        exact = attio.add_company("Acme Ltd", "acme.co.uk")
+        code, _ = self.live(outlook, attio, gemini)
+        self.assertEqual(code, 0)
+        (pid,) = attio.person_ids("nora@mail.acme.co.uk")
+        (deal,) = attio.deals_of(pid)
+        self.assertEqual(deal["company"], exact)
+        self.assertEqual(deal["name"], "Acme Ltd: demo")
 
     # ---- Case 16: Attio cannot be reached ---------------------------------------------------------------------------------------------
 

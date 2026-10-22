@@ -234,12 +234,23 @@ class AttioClient:
         }
 
     def find_company(self, domain):
+        """The company for a root domain. The lookup matches by root domain, so a company at a subdomain
+        (for example one Attio made itself for freemail.acme.com) is returned too. The record whose domain is
+        exactly the root domain wins; a subdomain record is only the fallback when there is no exact one."""
         data = self.call("POST", "/v2/objects/companies/records/query",
-                         body={"filter": {"domains": {"root_domain": {"$eq": domain}}}, "limit": 5})
+                         body={"filter": {"domains": {"root_domain": {"$eq": domain}}}, "limit": 25})
         records = data.get("data", [])
         if not records:
             return None
-        record = records[0]
+        wanted = domain.strip().lower()
+        exact = [
+            record for record in records
+            if any(
+                isinstance(value, dict) and str(value.get("domain") or "").strip().lower() == wanted
+                for value in (record.get("values") or {}).get("domains") or []
+            )
+        ]
+        record = (exact or records)[0]
         return {"id": record["id"]["record_id"], "name": first_value(record, "name", "value") or domain}
 
     def get_deal(self, deal_id):
