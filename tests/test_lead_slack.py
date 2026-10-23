@@ -1,11 +1,12 @@
-"""Pretend-data checks for workflows/02-email-to-attio/lead_slack.py (not written yet).
+"""Pretend-data checks for workflows/02-email-to-attio/lead_slack.py.
 
 These follow tests/cases/13-slack-step.md, Part A. They say what the new module must offer:
 
   lead_slack.announce_lead(token, message, category, webhook_url) -> "posted" or "exists"
         Posts one short message to Slack for a lead, once: it checks a marker on the email first and saves
         the marker after a successful post. Problems are raised as lead_slack.LeadSlackProblem (plain words).
-  lead_slack.slack_text(category, sender, subject) -> the one-line message text
+  lead_slack.slack_text(category, name, address, subject, body) -> the message text, on separate lines:
+        "Lead - ...", "From: name <address>", "Subject: ...", "Preview: first 200 characters of the body ..."
   lead_slack.post_to_slack(webhook_url, text)         the only place a message is posted
   lead_slack.graph(token, method, path, params=None, body=None)   the guard for Outlook (the marker only);
         refused requests raise lead_slack.BlockedRequest before anything leaves the computer
@@ -45,9 +46,19 @@ MARKER = "com.novawellness.slackposted"
 SENDER = "sam.fake@example.com"
 
 
-def message(mid="msg-1", subject="Demo please", sender=SENDER, name="Sam Fake"):
-    return {"id": mid, "subject": subject,
-            "from": {"emailAddress": {"address": sender, "name": name}}}
+BODY = "Hi team, we would love a demo next week."
+
+
+def message(mid="msg-1", subject="Demo please", sender=SENDER, name="Sam Fake", body=BODY):
+    result = {"id": mid, "subject": subject,
+              "from": {"emailAddress": {"address": sender, "name": name}}}
+    if body is not None:
+        result["body"] = {"contentType": "text", "content": body}
+    return result
+
+
+def lines_of(text):
+    return text.split("\n")
 
 
 def http_error(code):
@@ -175,39 +186,111 @@ class LeadSlackTests(unittest.TestCase):
         world = PretendWorld()
         self.assertEqual(self.announce(world), "posted")
         self.assertEqual(world.events, ["marker_read", "slack", "marker_write"])
-        self.assertEqual(world.posts, [{"text": f"Lead - Demo: {SENDER}, Demo please"}])
+        self.assertEqual(world.posts, [{"text": "\n".join([
+            "Lead - Demo",
+            f"From: Sam Fake &lt;{SENDER}&gt;",
+            "Subject: Demo please",
+            f"Preview: {BODY}",
+        ])}])
         self.assertEqual(len(world.marker_bodies), 1)
         self.assertEqual(world.marker_bodies[0]["extensionName"], MARKER)
         self.assertEqual(world.markers, {"msg-1"})
         self.assertEqual(lead_slack.MARKER_NAME, MARKER)
 
-    def test_s1_the_text_is_one_line_escaped_and_shortened(self):
-        text = lead_slack.slack_text("Lead - Pricing", SENDER, "Q&A <now> >> go")
-        self.assertEqual(text, f"Lead - Pricing: {SENDER}, Q&amp;A &lt;now&gt; &gt;&gt; go")
-        text = lead_slack.slack_text("Lead - Demo", SENDER, "Hello\nthere\r\nfriend\tok")
-        self.assertEqual(text, f"Lead - Demo: {SENDER}, Hello there friend ok")
-        long = lead_slack.slack_text("Lead - Demo", SENDER, "word " * 200)
-        self.assertLessEqual(len(long), 300)
-        self.assertTrue(long.endswith("..."))
-        self.assertNotIn("\n", long)
+    def test_s1_the_four_lines_are_in_order(self):
+        text = lead_slack.slack_text("Lead - Pricing", "Sam Fake", SENDER, "Prices", "Hello")
+        self.assertEqual(len(lines_of(text)), 4)
+        first, second, third, fourth = lines_of(text)
+        self.assertEqual(first, "Lead - Pricing")
+        self.assertTrue(second.startswith("From: "))
+        self.assertTrue(third.startswith("Subject: "))
+        self.assertTrue(fourth.startswith("Preview: "))
+
+    def test_s1_the_text_is_escaped_and_the_subject_shortened(self):
+        text = lead_slack.slack_text("Lead - Pricing", "Sam Fake", SENDER, "Q&A <now> >> go", "x")
+        self.assertIn("Subject: Q&amp;A &lt;now&gt; &gt;&gt; go", lines_of(text))
+        text = lead_slack.slack_text("Lead - Demo", "Sam Fake", SENDER, "Hello\nthere\r\nfriend\tok", "x")
+        self.assertIn("Subject: Hello there friend ok", lines_of(text))
+        text = lead_slack.slack_text("Lead - Demo", "Sam Fake", SENDER, "word " * 200, "x")
+        subject = lines_of(text)[2]
+        self.assertLessEqual(len(subject), len("Subject: ") + 150)
+        self.assertTrue(subject.endswith("..."))
+        self.assertEqual(len(lines_of(text)), 4, "a long subject stays on one line")
+
+    def test_s1_the_sender_line_is_name_then_address_in_angle_brackets_written_the_safe_way(self):
+        text = lead_slack.slack_text("Lead - Demo", "Sam & Co <Fake>", SENDER, "Hi", "x")
+        self.assertEqual(lines_of(text)[1], f"From: Sam &amp; Co &lt;Fake&gt; &lt;{SENDER}&gt;")
+        self.assertNotIn("<", text)
+        self.assertNotIn(">", text)
+
+    def test_s1_a_missing_name_falls_back_to_the_address_only(self):
+        for name in (None, "", "   ", SENDER):
+            with self.subTest(name=name):
+                text = lead_slack.slack_text("Lead - Demo", name, SENDER, "Hi", "x")
+                self.assertEqual(lines_of(text)[1], f"From: {SENDER}")
+        world = PretendWorld()
+        self.announce(world, msg={"id": "m", "from": {"emailAddress": {"address": SENDER}}, "subject": "Hi",
+                                  "body": {"content": "x"}})
+        self.assertEqual(lines_of(world.posts[0]["text"])[1], f"From: {SENDER}")
 
     def test_s1_a_missing_sender_or_subject_gets_a_plain_placeholder(self):
         world = PretendWorld()
-        self.announce(world, msg={"id": "m", "from": None, "subject": None})
-        self.assertEqual(world.posts, [{"text": "Lead - Demo: (unknown sender), (no subject)"}])
+        self.announce(world, msg={"id": "m", "from": None, "subject": None, "body": {"content": "x"}})
+        self.assertEqual(world.posts, [{"text": "Lead - Demo\nFrom: (unknown sender)\nSubject: (no subject)\nPreview: x"}])
         world = PretendWorld()
-        self.announce(world, msg={"id": "m", "from": {"emailAddress": {"name": "Sam Fake"}}, "subject": "Hi"})
-        self.assertEqual(world.posts, [{"text": "Lead - Demo: Sam Fake, Hi"}])
+        self.announce(world, msg={"id": "m", "from": {"emailAddress": {"name": "Sam Fake"}}, "subject": "Hi",
+                                  "body": {"content": "x"}})
+        self.assertEqual(lines_of(world.posts[0]["text"])[1], "From: Sam Fake")
 
-    def test_s1_only_the_category_sender_and_subject_are_in_the_text(self):
+    def test_s1_a_missing_body_leaves_out_the_preview_line(self):
+        bad_bodies = [{}, {"content": None}, {"content": ""}, {"content": "  \n\t "}, "not a dict", None]
+        for body in bad_bodies:
+            with self.subTest(body=body):
+                msg = message(body=None)
+                msg["body"] = body
+                world = PretendWorld()
+                self.announce(world, msg=msg)
+                text = world.posts[0]["text"]
+                self.assertEqual(len(lines_of(text)), 3)
+                self.assertNotIn("Preview", text)
+        world = PretendWorld()
+        self.announce(world, msg=message(body=None))   # no body key at all
+        self.assertEqual(len(lines_of(world.posts[0]["text"])), 3)
+
+    def test_s1_the_preview_is_one_line_of_the_first_200_characters_cut_with_dots(self):
+        body = "Line one\r\nline two\n\n\tline   three " + "word " * 100
+        text = lead_slack.slack_text("Lead - Demo", "Sam Fake", SENDER, "Hi", body)
+        preview = lines_of(text)[3]
+        self.assertEqual(len(lines_of(text)), 4, "line breaks in the body never make new lines")
+        self.assertTrue(preview.startswith("Preview: Line one line two line three word word"))
+        self.assertTrue(preview.endswith("..."))
+        one_line = " ".join(body.split())
+        self.assertEqual(preview, "Preview: " + one_line[:200].rstrip() + "...")
+
+    def test_s1_a_short_body_is_kept_whole_without_dots(self):
+        text = lead_slack.slack_text("Lead - Demo", "Sam Fake", SENDER, "Hi", "x" * 200)
+        self.assertEqual(lines_of(text)[3], "Preview: " + "x" * 200)
+        text = lead_slack.slack_text("Lead - Demo", "Sam Fake", SENDER, "Hi", "x" * 201)
+        self.assertEqual(lines_of(text)[3], "Preview: " + "x" * 200 + "...")
+
+    def test_s1_the_preview_is_written_the_safe_way_for_slack(self):
+        text = lead_slack.slack_text("Lead - Demo", "Sam Fake", SENDER, "Hi", "Fish & chips <b>now</b> > later")
+        self.assertEqual(lines_of(text)[3], "Preview: Fish &amp; chips &lt;b&gt;now&lt;/b&gt; &gt; later")
+
+    def test_s1_the_cut_is_made_before_the_safe_writing_so_no_character_is_split(self):
+        text = lead_slack.slack_text("Lead - Demo", "Sam Fake", SENDER, "Hi", "x" * 199 + "&" + "tail")
+        self.assertEqual(lines_of(text)[3], "Preview: " + "x" * 199 + "&amp;...")
+
+    def test_s1_only_the_category_name_address_subject_and_preview_are_in_the_text(self):
         msg = message()
-        msg["body"] = {"content": "PRIVATE-BODY-MARKER"}
         msg["bodyPreview"] = "PRIVATE-PREVIEW-MARKER"
+        msg["body"] = {"content": "Visible start. " + "x" * 300 + " PRIVATE-TAIL-MARKER"}
+        msg["internetMessageId"] = "PRIVATE-ID-MARKER"
         world = PretendWorld()
         self.announce(world, msg=msg)
         text = world.posts[0]["text"]
-        self.assertNotIn("PRIVATE", text)
-        self.assertNotIn("Sam Fake", text)
+        self.assertIn("Visible start.", text)
+        self.assertNotIn("PRIVATE", text, "only the first 200 characters of the body, and nothing else")
 
     # ---- Case S2: never twice ------------------------------------------------------------------
 
@@ -275,7 +358,7 @@ class LeadSlackTests(unittest.TestCase):
                 self.assertIn("posted to Slack", text)
                 self.assertIn("could not mark", text)
                 self.assertIn("twice", text)
-                for private in (SECRET_PART, FAKE_TOKEN, SENDER, "Demo please"):
+                for private in (SECRET_PART, FAKE_TOKEN, SENDER, "Demo please", "Sam Fake", BODY):
                     self.assertNotIn(private, text)
 
     def test_s4_known_limit_if_the_marker_could_not_be_saved_a_retry_posts_again(self):
@@ -374,6 +457,12 @@ class LeadSlackTests(unittest.TestCase):
             with self.subTest(pattern=pattern):
                 self.assertIsNone(re.search(pattern, text), f"found {pattern} in lead_slack.py")
 
+    def test_s6_the_code_text_never_prints_or_logs(self):
+        text = (WORKFLOWS / "02-email-to-attio" / "lead_slack.py").read_text(encoding="utf-8")
+        for pattern in (r"\bprint\s*\(", r"\blogging\b", r"\bsys\.std(out|err)\b", r"\bopen\s*\("):
+            with self.subTest(pattern=pattern):
+                self.assertIsNone(re.search(pattern, text), f"found {pattern} in lead_slack.py")
+
     def test_s5_the_permission_list_is_still_exactly_mail_readwrite(self):
         self.assertEqual(outlook_signin.SCOPES, ["Mail.ReadWrite"])
 
@@ -393,8 +482,20 @@ class LeadSlackTests(unittest.TestCase):
         ]
         for world in scenarios:
             text = self.announce_raises(world)
-            for private in (FAKE_TOKEN, SECRET_PART, "hooks.slack.com", SENDER, "Sam Fake", "Demo please"):
+            for private in (FAKE_TOKEN, SECRET_PART, "hooks.slack.com", SENDER, "Sam Fake", "Demo please", BODY):
                 self.assertNotIn(private, text)
+
+    def test_s6_the_preview_and_sender_are_only_in_the_slack_post(self):
+        # self.call() fails on any printed output; the Outlook requests are checked here.
+        world = PretendWorld()
+        self.announce(world, msg=message(body="PRIVATE-PREVIEW-WORDS"))
+        sent = [r for r in world.requests if not r.full_url.startswith("https://hooks.slack.com/")]
+        self.assertEqual(len(sent), 2)
+        for request in sent:
+            blob = request.full_url + (request.data or b"").decode()
+            for private in ("PRIVATE-PREVIEW-WORDS", "Sam Fake", SENDER):
+                self.assertNotIn(private, blob, "the preview and sender never go to Outlook")
+        self.assertIn("PRIVATE-PREVIEW-WORDS", world.posts[0]["text"])
 
     def test_s6_the_pause_between_posts_is_a_short_whole_or_decimal_number_of_seconds(self):
         self.assertIsInstance(lead_slack.PAUSE_SECONDS, (int, float))

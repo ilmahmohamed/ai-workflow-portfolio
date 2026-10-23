@@ -1,8 +1,10 @@
 """Post one short Slack message for a lead, once, and remember that it was posted.
 
-When the triage accepts a lead it calls announce_lead. The message says only the category, the sender's
-address and the subject (never the body, the draft or any detail of the lead). To post once per email, a small
-marker (a second hidden property on the email, fixed name and shape) is saved after a successful post, and an
+When the triage accepts a lead it calls announce_lead. The message is four short lines: the category, who it
+is from (name and address), the subject, and a preview (the first 200 characters of the email body, on one line).
+Nothing else about the lead goes in (never the draft or the details Gemini found). The sender and the preview
+appear only in the Slack message: this module prints nothing, and its problem messages never hold them. To post
+once per email, a small marker (a second hidden property on the email, fixed name and shape) is saved after a successful post, and an
 email that already has the marker is never posted again. The marker travels with the email when it is moved,
 and it works where local files are not kept (GitHub Actions).
 
@@ -31,6 +33,7 @@ VERSION = 1
 SLACK_PREFIX = "https://hooks.slack.com/services/"
 PAUSE_SECONDS = 1.1          # the triage waits this long between two posts, to stay inside Slack's rate limit
 MAX_SUBJECT_CHARS = 150
+MAX_PREVIEW_CHARS = 200
 
 ONE_MARKER = re.compile(r"^/me/messages/[^/]+/extensions/" + re.escape(MARKER_NAME) + r"$")
 ADD_MARKER = re.compile(r"^/me/messages/[^/]+/extensions$")
@@ -56,20 +59,42 @@ def _one_line(text):
     return " ".join(str(text or "").split())
 
 
-def slack_text(category, sender, subject):
-    """"category: sender, subject" on one line, safe for Slack, with a long subject shortened."""
-    sender = _one_line(sender) or "(unknown sender)"
-    subject = _one_line(subject) or "(no subject)"
-    if len(subject) > MAX_SUBJECT_CHARS:
-        subject = subject[: MAX_SUBJECT_CHARS - 3].rstrip() + "..."
-    text = f"{category}: {sender}, {subject}"
-    # Slack treats & < > as special, so they are written the safe way.
+def _slack_safe(text):
+    """Slack treats & < > as special, so they are written the safe way."""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def slack_text(category, name, address, subject, body):
+    """The message, one item per line, safe for Slack. Without a body there is no Preview line."""
+    name = _one_line(name)
+    address = _one_line(address)
+    if name and address and name != address:
+        sender = f"{name} <{address}>"
+    else:
+        sender = name or address or "(unknown sender)"
+    subject = _one_line(subject) or "(no subject)"
+    if len(subject) > MAX_SUBJECT_CHARS:
+        subject = subject[: MAX_SUBJECT_CHARS - 3].rstrip() + "..."
+    lines = [category, f"From: {sender}", f"Subject: {subject}"]
+    preview = _one_line(body)
+    if preview:
+        # Cut before the safe writing, so a & can never be split into half of &amp;.
+        if len(preview) > MAX_PREVIEW_CHARS:
+            preview = preview[:MAX_PREVIEW_CHARS].rstrip() + "..."
+        lines.append(f"Preview: {preview}")
+    return "\n".join(_slack_safe(line) for line in lines)
+
+
 def _sender_of(message):
+    """(name, address) of the sender; either may be empty."""
     address = ((message.get("from") or {}).get("emailAddress")) or {}
-    return address.get("address") or address.get("name") or ""
+    return address.get("name") or "", address.get("address") or ""
+
+
+def _body_of(message):
+    body = message.get("body")
+    content = body.get("content") if isinstance(body, dict) else None
+    return content if isinstance(content, str) else ""
 
 
 # ---- The Outlook guard (the marker only) ----------------------------------------------
@@ -188,7 +213,8 @@ def announce_lead(token, message, category, webhook_url):
     message_id = message["id"]
     if _marker_exists(token, message_id):
         return "exists"
-    post_to_slack(webhook_url, slack_text(category, _sender_of(message), message.get("subject")))
+    name, address = _sender_of(message)
+    post_to_slack(webhook_url, slack_text(category, name, address, message.get("subject"), _body_of(message)))
     try:
         _save_marker(token, message_id)
     except LeadSlackProblem:

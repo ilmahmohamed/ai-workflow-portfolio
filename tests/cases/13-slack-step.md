@@ -15,7 +15,8 @@ The message says only: the category, the sender's address and the subject. Never
 
 - Input: a lead email with no marker.
 - Expected: one message is posted to Slack, then a small marker (a second hidden property on the email, fixed name and shape) is saved on the email saying it was posted. The answer is "posted".
-- Expected: the message text is "category: sender, subject" on one line. The characters & < > are written the safe way for Slack, a very long subject is shortened, and line breaks in the subject become spaces.
+- Expected: the message text is four lines: the category, "From: name <address>" (just the address if there is no name), "Subject: ..." and "Preview: ..." (the first 200 characters of the body on one line, cut with ... when longer; no Preview line if the body is empty). The characters & < > are written the safe way for Slack, a very long subject is shortened, and line breaks in the subject or body become spaces.
+- The sender and the preview appear only in the Slack message. They are never printed and never in GitHub Actions logs.
 
 ### Case S2: never twice
 

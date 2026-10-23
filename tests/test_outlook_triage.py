@@ -1990,8 +1990,10 @@ class TriageTests(unittest.TestCase):
         })
         code, _ = self.live(outlook, gemini, "--slack", "test")
         self.assertEqual(code, 0)
-        self.assertEqual(self.slack.texts(), ["Lead - Demo: sam@example.com, Demo please",
-                                              "Lead - Pricing: sam@example.com, Prices please"])
+        self.assertEqual(self.slack.texts(), [
+            f"Lead - Demo\nFrom: Sam &lt;sam@example.com&gt;\nSubject: Demo please\nPreview: Hello there {BODY_MARKER}",
+            f"Lead - Pricing\nFrom: Sam &lt;sam@example.com&gt;\nSubject: Prices please\nPreview: Hello there {BODY_MARKER}",
+        ])
         self.assertEqual(len(outlook.marker_posts), 2)
         for message_id in ("m2", "m3", "m4"):
             self.assertFalse(outlook.slack_marked(message_id))
@@ -2063,8 +2065,10 @@ class TriageTests(unittest.TestCase):
         self.live(outlook, gemini, "--slack", "test", slack=PretendSlack(errors={1: http_error(500)}))
         code, _ = self.live(outlook, gemini, "--slack", "test")
         self.assertEqual(code, 0)
-        self.assertEqual(self.slack.texts(), ["Lead - Demo: one@example.com, Demo please",
-                                              "Lead - Pricing: two@example.com, Prices please"])
+        self.assertEqual([text.split("\n")[:3] for text in self.slack.texts()], [
+            ["Lead - Demo", "From: Sam &lt;one@example.com&gt;", "Subject: Demo please"],
+            ["Lead - Pricing", "From: Sam &lt;two@example.com&gt;", "Subject: Prices please"],
+        ])
         self.assertEqual(len(outlook.extension_posts), 2, "no second saved answer for the first lead")
         self.assertEqual((outlook.where("m1"), outlook.where("m2")), ("leads", "leads"))
 
@@ -2109,17 +2113,28 @@ class TriageTests(unittest.TestCase):
         self.assertIn("posted to Slack (live)", output)
         self.assertIn("Posted to Slack (live): 1", output)
 
-    def test_s12_only_the_category_sender_and_subject_are_in_the_post(self):
+    def test_s12_the_post_has_the_category_sender_subject_and_a_preview_but_nothing_from_the_answer(self):
         outlook = PretendOutlook([msg("m1", "Demo please", body="PRIVATE-BODY-WORDS", name="Display Name Marker")])
         answer = lead_answer("demo", name="NAME-MARKER-PERSON", company="COMPANY-MARKER-CO", role="ROLE-MARKER-JOB",
                              summary="SUMMARY-MARKER-TEXT")
         gemini = PretendGemini({"Demo please": json.dumps(answer)})
         self.live(outlook, gemini, "--slack", "test")
         (text,) = self.slack.texts()
-        self.assertEqual(text, "Lead - Demo: sam@example.com, Demo please")
-        for marker in ("NAME-MARKER", "COMPANY-MARKER", "ROLE-MARKER", "SUMMARY-MARKER", "DRAFT", "PRIVATE-BODY",
-                       BODY_MARKER, "Display Name Marker", "A member of our team"):
+        self.assertEqual(text, "Lead - Demo\nFrom: Display Name Marker &lt;sam@example.com&gt;\n"
+                               f"Subject: Demo please\nPreview: PRIVATE-BODY-WORDS {BODY_MARKER}")
+        for marker in ("NAME-MARKER", "COMPANY-MARKER", "ROLE-MARKER", "SUMMARY-MARKER", "DRAFT",
+                       "A member of our team"):
             self.assertNotIn(marker, text)
+
+    def test_s12_the_preview_and_sender_never_appear_in_the_printed_output(self):
+        outlook = PretendOutlook([msg("m1", "Demo please", body="PREVIEW-ONLY-WORDS", name="Printed Name Marker")])
+        gemini = PretendGemini({"Demo please": lead_reply("demo")})
+        code, output = self.live(outlook, gemini, "--slack", "live")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.slack.texts()), 1)
+        for private in ("PREVIEW-ONLY-WORDS", BODY_MARKER, "Printed Name Marker", "sam@example.com", "Demo please"):
+            self.assertNotIn(private, output)
+        self.assertNotIn("PREVIEW-ONLY-WORDS", self.saved_text())
 
     def test_s13_a_dry_run_posts_nothing_marks_nothing_and_changes_nothing(self):
         for mode in ("test", "live"):
