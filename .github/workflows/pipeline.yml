@@ -50,6 +50,8 @@ jobs:
 
       # Both steps pass their output through the log filter, which blanks anything shaped like an
       # address. The mailbox is the only memory (--stateless), so no file is kept between runs.
+      # The filtered log is also copied to the runner's temporary disk (gone when the run ends), so that
+      # the alert step can name the reason for a failure.
       - name: Triage
         id: triage
         shell: bash
@@ -59,7 +61,7 @@ jobs:
           MS_TOKEN_CACHE: ${{ secrets.MS_TOKEN_CACHE }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python workflows/02-email-to-attio/outlook_triage.py $LIVE --slack live --drafts on --stateless 2>&1 | python workflows/02-email-to-attio/log_filter.py
+          python workflows/02-email-to-attio/outlook_triage.py $LIVE --slack live --drafts on --stateless 2>&1 | python workflows/02-email-to-attio/log_filter.py | tee "$RUNNER_TEMP/triage.log"
 
       - name: Attio sync
         id: attio
@@ -70,15 +72,19 @@ jobs:
           ATTIO_API_KEY: ${{ secrets.ATTIO_API_KEY }}
           ATTIO_DEAL_OWNER: ${{ secrets.ATTIO_DEAL_OWNER }}
         run: |
-          python workflows/02-email-to-attio/leads_to_attio.py $LIVE --stateless 2>&1 | python workflows/02-email-to-attio/log_filter.py
+          python workflows/02-email-to-attio/leads_to_attio.py $LIVE --stateless 2>&1 | python workflows/02-email-to-attio/log_filter.py | tee "$RUNNER_TEMP/attio.log"
 
-      # If anything above failed: say which step, with a link to the run. Nothing else is sent.
-      # Live runs only: a dry run posts nothing anywhere (its result is on the run page).
+      # If anything above failed: say which step, why (one reason from a fixed list), how many are still waiting,
+      # the first one waiting (a name and a subject only) and a link to the run. alert_message.py works that out;
+      # if it cannot, the plain message is posted instead. Live runs only: a dry run posts nothing anywhere
+      # (its result is on the run page).
       - name: Alert in #automation-log
         if: failure() && env.LIVE != ''
         shell: bash
         env:
           SLACK_LOG_WEBHOOK_URL: ${{ secrets.SLACK_LOG_WEBHOOK_URL }}
+          MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+          MS_TOKEN_CACHE: ${{ secrets.MS_TOKEN_CACHE }}
           INSTALL: ${{ steps.install.outcome }}
           TRIAGE: ${{ steps.triage.outcome }}
           ATTIO: ${{ steps.attio.outcome }}
@@ -88,7 +94,9 @@ jobs:
           if [ "$INSTALL" = failure ]; then STEP="Install libraries"; fi
           if [ "$TRIAGE" = failure ]; then STEP="Triage"; fi
           if [ "$ATTIO" = failure ]; then STEP="Attio sync"; fi
-          curl -sS --fail --max-time 20 -o /dev/null -X POST -H 'Content-Type: application/json' --data "{\"text\":\"Pipeline step failed: $STEP. Run: $RUN_URL\"}" "$SLACK_LOG_WEBHOOK_URL" || echo "The alert could not be posted."
+          PAYLOAD=$(timeout 90 python workflows/02-email-to-attio/alert_message.py "$STEP" 2>/dev/null) || PAYLOAD=""
+          if [ -z "$PAYLOAD" ]; then PAYLOAD="{\"text\":\"Pipeline step failed: $STEP. Run: $RUN_URL\"}"; fi
+          curl -sS --fail --max-time 20 -o /dev/null -X POST -H 'Content-Type: application/json' --data "$PAYLOAD" "$SLACK_LOG_WEBHOOK_URL" || echo "The alert could not be posted."
 
   # Once a day: proof that the schedule is still running. No concurrency group, so it can never
   # push a waiting pipeline run out of the queue.

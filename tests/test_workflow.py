@@ -167,7 +167,46 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn(needed, alert)
         self.assertNotIn("SLACK_WEBHOOK_URL: ", alert.replace("SLACK_LOG_WEBHOOK_URL", ""))
         for private in ("sender", "subject", "body", "from", "email", "address"):
-            self.assertNotRegex(alert.lower().replace("github.", ""), rf"\b{private}\b")
+            # (the folder name 02-email-to-attio in the script's path is not a detail of any email)
+            self.assertNotRegex(alert.lower().replace("github.", "").replace("workflows/02-email-to-attio/", ""),
+                                rf"\b{private}\b")
+
+    def alert_step(self):
+        body = jobs()["pipeline"]
+        return body[body.index("if: failure()"):]
+
+    def test_each_step_keeps_a_copy_of_its_filtered_log_for_the_alert(self):
+        # The copy is made AFTER the filter, so it never holds an address. It stays on the runner's temporary disk.
+        for needle, name in (("outlook_triage.py", "triage.log"), ("leads_to_attio.py", "attio.log")):
+            line = [l for l in run_lines() if needle in l][0]
+            self.assertRegex(line, r"log_filter\.py \| tee \"\$RUNNER_TEMP/" + re.escape(name) + r"\"$")
+
+    def test_the_alert_builds_its_message_with_the_helper_and_still_posts_if_that_fails(self):
+        alert = self.alert_step()
+        self.assertIn("alert_message.py", alert)
+        self.assertRegex(alert, r"timeout \d+ python workflows/02-email-to-attio/alert_message\.py \"\$STEP\" 2>/dev/null")
+        # the plain message is the fallback when the helper gives nothing
+        self.assertRegex(alert, r"Pipeline step failed: \$STEP\. Run: \$RUN_URL")
+        self.assertIn("curl", alert)
+        self.assertLess(alert.index("alert_message.py"), alert.index("curl"))
+        self.assertRegex(alert, r"\|\| PAYLOAD=")
+        self.assertRegex(alert, r"-z \"\$PAYLOAD\"")
+
+    def test_the_alert_step_can_read_the_mailbox_but_only_through_the_named_secrets(self):
+        alert = self.alert_step()
+        for name in ("MS_CLIENT_ID", "MS_TOKEN_CACHE", "SLACK_LOG_WEBHOOK_URL"):
+            self.assertIn(f"{name}: ${{{{ secrets.{name} }}}}", alert)
+        for name in SECRETS - {"MS_CLIENT_ID", "MS_TOKEN_CACHE", "SLACK_LOG_WEBHOOK_URL"}:
+            self.assertNotIn(name, alert, "the alert step is given only the secrets it needs")
+        self.assertIn("RUN_URL:", alert)
+
+    def test_the_alert_posts_what_the_helper_printed_and_only_that(self):
+        alert = self.alert_step()
+        self.assertRegex(alert, r"--data \"\$PAYLOAD\"")
+        self.assertNotIn("echo", alert.replace('|| echo "The alert could not be posted."', ""))
+        self.assertNotIn("$(cat", alert)
+        self.assertNotIn("triage.log", alert, "the log is read by the helper, never shown or sent by the workflow")
+        self.assertNotIn("attio.log", alert)
 
     def test_the_alert_is_the_last_step_of_the_pipeline_job(self):
         body = jobs()["pipeline"]
