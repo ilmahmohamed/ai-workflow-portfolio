@@ -1,7 +1,5 @@
 # Week 2 log (Days 6 to 10)
 
-Practice company: Nova Wellness (fictional). All data in this repo is made up. No passwords, keys, webhook links or real lead details are included.
-
 ## Summary
 
 - Built an email-to-Attio pipeline: Outlook Leads folder, Gemini reads each email once, Attio gets a person, a deal at New and a note, Slack #leads gets an alert, and a reply draft is saved in Outlook (never sent).
@@ -54,13 +52,11 @@ Practice company: Nova Wellness (fictional). All data in this repo is made up. N
 - **No secrets in git.** I scanned all 73 commits for keys, webhook links and passwords. Only obviously fake test values were found.
 - **Reading other automations:** reviewed my own Zapier Zap and a public Make template (see `automation-reviews.md`) and wrote why I chose a script over Zapier for the Slack alert (`zapier-vs-custom.md`).
 
-## Findings and open questions
+## Findings
 
-- Attio matches people by email. Emails from the same address become notes on the same person and deal. Open question: new deal per request, or notes on one deal?
+- Attio matches people by email. Emails from the same address become notes on the same person and deal. 
 - Gmail senders get a person and a deal but no company, because gmail.com is not a real company. The studio name is saved in the deal note. Creating companies from names in the email body risks duplicates.
-- A Dutch lead got an English draft reply. The extraction handled the Dutch email correctly, but the draft was not in Dutch. Open question: should drafts match the sender's language?
-- My Attio workspace trial ends in about 3 days. I need to find out if it will be extended, because the pipeline needs it through Week 3.
-- The Outlook sign-in saved on GitHub cannot refresh itself. I will re-upload it before it expires.
+- A Dutch lead got an English draft reply. The extraction handled the Dutch email correctly, but the draft was not in Dutch.
 - GitHub pauses scheduled workflows after 60 days with no repo activity. A daily "Pipeline alive" message in #automation-log shows the schedule is still running.
 
 ## Speed test
